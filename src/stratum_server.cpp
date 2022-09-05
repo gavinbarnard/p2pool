@@ -1206,6 +1206,7 @@ void StratumServer::api_update_local_stats(uint64_t timestamp)
 	}
 
 	int shares_found = m_totalFoundShares;
+	uint32_t pshares_found = m_pool->side_chain().get_shares_in_window();
 
 	double current_effort = static_cast<double>(hashes_since_last_share) * 100.0 / m_pool->side_chain().difficulty().to_double();
 	const double reward = m_pool->side_chain().get_reward(m_pool->params().m_wallet);
@@ -1213,13 +1214,14 @@ void StratumServer::api_update_local_stats(uint64_t timestamp)
 	int incoming_connections = m_numIncomingConnections;
 
 	m_pool->api()->set(p2pool_api::Category::LOCAL, "stats",
-		[hashrate_15m, hashrate_1h, hashrate_24h, total_hashes, shares_found, reward, average_effort, current_effort, connections, incoming_connections](log::Stream& s)
+		[hashrate_15m, hashrate_1h, hashrate_24h, total_hashes, pshares_found, shares_found, reward, average_effort, current_effort, connections, incoming_connections](log::Stream& s)
 		{
 			s << "{\"hashrate_15m\":" << hashrate_15m
 				<< ",\"hashrate_1h\":" << hashrate_1h
 				<< ",\"hashrate_24h\":" << hashrate_24h
 				<< ",\"total_hashes\":" << total_hashes
 				<< ",\"shares_found\":" << shares_found
+				<< ",\"p2pool_shares\":" << pshares_found
 				<< ",\"reward\":" << reward
 				<< ",\"average_effort\":" << average_effort
 				<< ",\"current_effort\":" << current_effort

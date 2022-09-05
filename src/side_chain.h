@@ -61,6 +61,7 @@ public:
 	void print_status(bool obtain_sidechain_lock = true) const;
 	double get_reward_share(const Wallet& w) const;
 	double get_reward(const Wallet& w) const;
+	uint32_t get_shares_in_window() const;
 
 	// Consensus ID can be used to spawn independent P2Pools with their own sidechains
 	// It's never sent over the network to avoid revealing it to the possible man in the middle

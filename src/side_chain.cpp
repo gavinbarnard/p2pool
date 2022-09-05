@@ -974,6 +974,45 @@ void SideChain::print_status(bool obtain_sidechain_lock) const
 	);
 }
 
+uint32_t SideChain::get_shares_in_window() const
+{
+	std::vector<hash> blocks_in_window;
+	blocks_in_window.reserve(m_chainWindowSize * 9 / 8);
+	
+	const PoolBlock* tip = m_chainTip;
+	const PoolBlock* cur = tip;
+	//const uint64_t tip_height = tip ? tip->m_sidechainHeight : 0;
+	uint64_t block_depth = 0;
+	uint32_t total_blocks_in_window = 0;
+	//uint32_t total_uncles_in_window = 0;
+	// each dot corresponds to m_chainWindowSize / 30 shares, with current values, 2160 / 30 = 72
+	std::array<uint32_t, 30> our_blocks_in_window{};
+	//std::array<uint32_t, 30> our_uncles_in_window{};
+
+	//const uint32_t our_blocks_in_window_total = std::accumulate(our_blocks_in_window.begin(), our_blocks_in_window.end(), 0U);
+	uint32_t counter = 0;
+	//const uint32_t our_uncles_in_window_total = std::accumulate(our_uncles_in_window.begin(), our_uncles_in_window.end(), 0U);
+	
+	while (cur) {
+		blocks_in_window.emplace_back(cur->m_sidechainId);
+		++total_blocks_in_window;
+
+		if (cur->m_minerWallet == m_pool->params().m_wallet) {
+			// this produces an integer division with quotient rounded up, avoids non-whole divisions from overflowing on total_blocks_in_window
+			const size_t window_index = (total_blocks_in_window - 1) / ((m_chainWindowSize + our_blocks_in_window.size() - 1) / our_blocks_in_window.size());
+			our_blocks_in_window[std::min(window_index, our_blocks_in_window.size() - 1)]++; // clamp window_index, even if total_blocks_in_window is not larger than m_chainWindowSize
+			counter++;
+		}
+
+		++block_depth;
+		if (block_depth >= m_chainWindowSize) {
+			break;
+		}
+		cur = get_parent(cur);
+	}
+	return (uint32_t) counter;
+}
+
 double SideChain::get_reward_share(const Wallet& w) const
 {
 	uint64_t reward = 0;
