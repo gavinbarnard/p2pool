@@ -49,13 +49,18 @@ TEST(pool_block, deserialize)
 	f.read(reinterpret_cast<char*>(buf.data()), buf.size());
 	ASSERT_EQ(f.good(), true);
 
-	ASSERT_EQ(b.deserialize(buf.data(), buf.size(), sidechain, nullptr), 0);
+	ASSERT_EQ(b.deserialize(buf.data(), buf.size(), sidechain, nullptr, false), 0);
 
-	ASSERT_EQ(b.m_mainChainData.size(), 5607);
-	ASSERT_EQ(b.m_mainChainHeaderSize, 43);
-	ASSERT_EQ(b.m_mainChainMinerTxSize, 506);
-	ASSERT_EQ(b.m_mainChainOutputsOffset, 54);
-	ASSERT_EQ(b.m_mainChainOutputsBlobSize, 420);
+	size_t header_size, miner_tx_size;
+	int outputs_offset, outputs_blob_size;
+	const std::vector<uint8_t> mainchain_data = b.serialize_mainchain_data(&header_size, &miner_tx_size, &outputs_offset, &outputs_blob_size);
+
+	ASSERT_EQ(mainchain_data.size(), 5607);
+	ASSERT_EQ(header_size, 43);
+	ASSERT_EQ(miner_tx_size, 506);
+	ASSERT_EQ(outputs_offset, 54);
+	ASSERT_EQ(outputs_blob_size, 420);
+
 	ASSERT_EQ(b.m_majorVersion, 14);
 	ASSERT_EQ(b.m_minorVersion, 14);
 	ASSERT_EQ(b.m_timestamp, 1630934403);
@@ -65,14 +70,12 @@ TEST(pool_block, deserialize)
 	ASSERT_EQ(b.m_extraNonceSize, 4);
 	ASSERT_EQ(b.m_extraNonce, 28);
 	ASSERT_EQ(b.m_transactions.size(), 159);
-	ASSERT_EQ(b.m_sideChainData.size(), 146);
 	ASSERT_EQ(b.m_uncles.size(), 0);
 	ASSERT_EQ(b.m_sidechainHeight, 53450);
 	ASSERT_EQ(b.m_difficulty.lo, 319296691);
 	ASSERT_EQ(b.m_difficulty.hi, 0);
 	ASSERT_EQ(b.m_cumulativeDifficulty.lo, 12544665764606ull);
 	ASSERT_EQ(b.m_cumulativeDifficulty.hi, 0);
-	ASSERT_EQ(b.m_tmpTxExtra.size(), 0);
 	ASSERT_EQ(b.m_depth, 0);
 	ASSERT_EQ(b.m_verified, false);
 	ASSERT_EQ(b.m_invalid, false);
@@ -134,7 +137,7 @@ TEST(pool_block, verify)
 			p += sizeof(uint32_t);
 
 			ASSERT_TRUE(p + n <= e);
-			ASSERT_EQ(b.deserialize(p, n, sidechain, nullptr), 0);
+			ASSERT_EQ(b.deserialize(p, n, sidechain, nullptr, false), 0);
 			p += n;
 
 			sidechain.add_block(b);

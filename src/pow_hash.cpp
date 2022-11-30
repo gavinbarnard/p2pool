@@ -141,7 +141,7 @@ void RandomX_Hasher::set_seed_async(const hash& seed)
 	const int err = uv_queue_work(uv_default_loop_checked(), &work->req,
 		[](uv_work_t* req)
 		{
-			bkg_jobs_tracker.start("RandomX_Hasher::set_seed_async");
+			BACKGROUND_JOB_START(RandomX_Hasher::set_seed_async);
 			Work* work = reinterpret_cast<Work*>(req->data);
 			if (!work->pool->stopped()) {
 				work->hasher->set_seed(work->seed);
@@ -150,7 +150,7 @@ void RandomX_Hasher::set_seed_async(const hash& seed)
 		[](uv_work_t* req, int)
 		{
 			delete reinterpret_cast<Work*>(req->data);
-			bkg_jobs_tracker.stop("RandomX_Hasher::set_seed_async");
+			BACKGROUND_JOB_STOP(RandomX_Hasher::set_seed_async);
 		}
 	);
 
@@ -382,8 +382,8 @@ RandomX_Hasher_RPC::RandomX_Hasher_RPC(p2pool* pool)
 	// Init loop user data before running it
 	GetLoopUserData(&m_loop);
 
-	uv_async_init(&m_loop, &m_shutdownAsync, on_shutdown);
-	uv_async_init(&m_loop, &m_kickTheLoopAsync, nullptr);
+	uv_async_init_checked(&m_loop, &m_shutdownAsync, on_shutdown);
+	uv_async_init_checked(&m_loop, &m_kickTheLoopAsync, nullptr);
 	m_shutdownAsync.data = this;
 
 	uv_mutex_init_checked(&m_requestMutex);
@@ -413,9 +413,19 @@ RandomX_Hasher_RPC::~RandomX_Hasher_RPC()
 void RandomX_Hasher_RPC::loop(void* data)
 {
 	LOGINFO(1, "event loop started");
+
 	RandomX_Hasher_RPC* hasher = static_cast<RandomX_Hasher_RPC*>(data);
-	uv_run(&hasher->m_loop, UV_RUN_DEFAULT);
-	uv_loop_close(&hasher->m_loop);
+
+	int err = uv_run(&hasher->m_loop, UV_RUN_DEFAULT);
+	if (err) {
+		LOGWARN(1, "uv_run returned " << err);
+	}
+
+	err = uv_loop_close(&hasher->m_loop);
+	if (err) {
+		LOGWARN(1, "uv_loop_close returned error " << uv_err_name(err));
+	}
+
 	LOGINFO(1, "event loop stopped");
 }
 
@@ -438,7 +448,7 @@ bool RandomX_Hasher_RPC::calculate(const void* data_ptr, size_t size, uint64_t h
 
 	const Params& params = m_pool->params();
 
-	JSONRPCRequest::call(params.m_host, params.m_rpcPort, buf, params.m_rpcLogin,
+	JSONRPCRequest::call(params.m_host, params.m_rpcPort, buf, params.m_rpcLogin, params.m_socks5Proxy,
 		[&result, &h](const char* data, size_t size)
 		{
 			rapidjson::Document doc;

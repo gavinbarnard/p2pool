@@ -34,6 +34,9 @@
 
 namespace p2pool {
 
+#define P2POOL_VERSION_MAJOR 2
+#define P2POOL_VERSION_MINOR 6
+
 extern const char* VERSION;
 
 template<typename T> struct not_implemented { enum { value = 0 }; };
@@ -156,21 +159,29 @@ public:
 	BackgroundJobTracker();
 	~BackgroundJobTracker();
 
-	void start(const char* name);
-	void stop(const char* name);
+	template<size_t N> FORCEINLINE void start(const char (&name)[N]) { start_internal(name); }
+	template<size_t N> FORCEINLINE void stop (const char (&name)[N]) { stop_internal (name); }
+
 	void wait();
 	void print_status();
 
 private:
+	void start_internal(const char* name);
+	void stop_internal(const char* name);
+
 	struct Impl;
 	Impl* m_impl;
 };
 
 extern BackgroundJobTracker bkg_jobs_tracker;
 
+#define BACKGROUND_JOB_START(x) do { bkg_jobs_tracker.start(#x); } while (0)
+#define BACKGROUND_JOB_STOP(x)  do { bkg_jobs_tracker.stop(#x);  } while (0)
+
 void set_main_thread();
 bool is_main_thread();
 
+extern bool disable_resolve_host;
 bool resolve_host(std::string& host, bool& is_v6);
 
 template <typename Key, typename T>
@@ -218,6 +229,9 @@ FORCEINLINE uint64_t bsr(uint64_t x)
 #else
 #define bsr bsr_reference
 #endif
+
+bool str_to_ip(bool is_v6, const char* ip, raw_ip& result);
+bool is_localhost(const std::string& host);
 
 } // namespace p2pool
 

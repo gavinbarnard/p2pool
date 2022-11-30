@@ -25,7 +25,7 @@ struct Params
 {
 	Params(int argc, char* argv[]);
 
-	bool ok() const;
+	bool valid() const;
 
 	std::string m_host = "127.0.0.1";
 	uint32_t m_rpcPort = 18081;
@@ -45,11 +45,14 @@ struct Params
 	bool m_disableRandomX = true;
 #endif
 	uint32_t m_maxOutgoingPeers = 10;
-	uint32_t m_maxIncomingPeers = 1000;
+	uint32_t m_maxIncomingPeers = 450;
 	uint32_t m_minerThreads = 0;
 	bool m_mini = false;
 	bool m_autoDiff = true;
 	std::string m_rpcLogin;
+	std::string m_socks5Proxy;
+	bool m_dns = true;
+	uint32_t m_p2pExternalPort = 0;
 };
 
 } // namespace p2pool

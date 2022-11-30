@@ -32,7 +32,7 @@ namespace p2pool {
 #define STR2(X) STR(X)
 #define STR(X) #X
 
-const char* VERSION = "v2.3 (built"
+const char* VERSION = "v" STR2(P2POOL_VERSION_MAJOR) "." STR2(P2POOL_VERSION_MINOR) " (built"
 #if defined(__clang__)
 	" with clang/" __clang_version__
 #elif defined(__GNUC__)
@@ -73,6 +73,54 @@ void make_thread_background()
 		sched_setscheduler(0, SCHED_BATCH, &param);
 	}
 #endif
+}
+
+NOINLINE difficulty_type& difficulty_type::operator/=(difficulty_type b)
+{
+	if (*this < b) {
+		lo = 0;
+		hi = 0;
+		return *this;
+	}
+
+	if (*this - b < b) {
+		lo = 1;
+		hi = 0;
+		return *this;
+	}
+
+	if (b.hi == 0) {
+		return operator/=(b.lo);
+	}
+
+	const uint64_t shift = bsr(b.hi) + 1;
+	const uint64_t divisor = shiftleft128(b.lo, b.hi, 64 - shift);
+
+	uint64_t t;
+	if (hi < divisor) {
+		uint64_t r;
+		t = udiv128(hi, lo, divisor, &r) >> shift;
+	}
+	else {
+		uint64_t r;
+		t = shiftright128(udiv128(hi - divisor, lo, divisor, &r), 1, shift);
+	}
+
+	difficulty_type product;
+	product.lo = umul128(b.lo, t, &product.hi);
+
+	uint64_t t1, t2;
+	t1 = umul128(b.hi, t, &t2);
+	product.hi += t1;
+
+	if (t2 || (product.hi < t1) || (*this < product)) {
+		--t;
+	}
+
+	lo = t;
+	hi = 0;
+
+	return *this;
 }
 
 NOINLINE bool difficulty_type::check_pow(const hash& pow_hash) const
@@ -124,13 +172,6 @@ NOINLINE bool difficulty_type::check_pow(const hash& pow_hash) const
 	}
 
 	return true;
-}
-
-difficulty_type operator+(const difficulty_type& a, const difficulty_type& b)
-{
-	difficulty_type result = a;
-	result += b;
-	return result;
 }
 
 std::ostream& operator<<(std::ostream& s, const difficulty_type& d)
@@ -197,6 +238,9 @@ std::istream& operator>>(std::istream& s, hash& h)
 			found_number = true;
 			h.h[index >> 1] = (h.h[index >> 1] << 4) | digit;
 			++index;
+			if (index >= HASH_SIZE * 2) {
+				return s;
+			}
 		}
 		else if (found_number) {
 			return s;
@@ -228,6 +272,15 @@ void uv_rwlock_init_checked(uv_rwlock_t* lock)
 	const int result = uv_rwlock_init(lock);
 	if (result) {
 		LOGERR(1, "failed to create rwlock, error " << uv_err_name(result));
+		panic();
+	}
+}
+
+void uv_async_init_checked(uv_loop_t* loop, uv_async_t* async, uv_async_cb async_cb)
+{
+	const int err = uv_async_init(loop, async, async_cb);
+	if (err) {
+		LOGERR(1, "uv_async_init failed, error " << uv_err_name(err));
 		panic();
 	}
 }
@@ -278,21 +331,22 @@ struct BackgroundJobTracker::Impl
 
 	void wait()
 	{
+		uint64_t last_msg_time = 0;
 		do {
-			bool is_empty = true;
 			{
 				MutexLock lock(m_lock);
-				is_empty = m_jobs.empty();
-				for (const auto& job : m_jobs) {
-					LOGINFO(1, "waiting for " << job.second << " \"" << job.first << "\" jobs to finish");
+				if (m_jobs.empty()) {
+					return;
+				}
+				const uint64_t t = seconds_since_epoch();
+				if (t != last_msg_time) {
+					last_msg_time = t;
+					for (const auto& job : m_jobs) {
+						LOGINFO(1, "waiting for " << job.second << " \"" << job.first << "\" jobs to finish");
+					}
 				}
 			}
-
-			if (is_empty) {
-				return;
-			}
-
-			std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		} while (1);
 	}
 
@@ -314,8 +368,10 @@ struct BackgroundJobTracker::Impl
 		LOGINFO(0, "background jobs running:" << log::const_buf(buf, s.m_pos));
 	}
 
+	struct Compare { FORCEINLINE bool operator()(const char* a, const char* b) const { return strcmp(a, b) < 0; } };
+
 	uv_mutex_t m_lock;
-	std::map<std::string, int32_t> m_jobs;
+	std::map<const char*, int32_t, Compare> m_jobs;
 };
 
 BackgroundJobTracker::BackgroundJobTracker() : m_impl(new Impl())
@@ -327,12 +383,12 @@ BackgroundJobTracker::~BackgroundJobTracker()
 	delete m_impl;
 }
 
-void BackgroundJobTracker::start(const char* name)
+void BackgroundJobTracker::start_internal(const char* name)
 {
 	m_impl->start(name);
 }
 
-void BackgroundJobTracker::stop(const char* name)
+void BackgroundJobTracker::stop_internal(const char* name)
 {
 	m_impl->stop(name);
 }
@@ -353,8 +409,15 @@ static thread_local bool main_thread = false;
 void set_main_thread() { main_thread = true; }
 bool is_main_thread() { return main_thread; }
 
+bool disable_resolve_host = false;
+
 bool resolve_host(std::string& host, bool& is_v6)
 {
+	if (disable_resolve_host) {
+		LOGERR(1, "resolve_host was called with DNS disabled for host " << host);
+		return false;
+	}
+
 	addrinfo hints{};
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
@@ -430,6 +493,57 @@ NOINLINE uint64_t bsr_reference(uint64_t x)
 	y <<= n2;
 
 	return bsr8_table.data[y >> 24] - n0 - n1 - n2;
+}
+
+bool str_to_ip(bool is_v6, const char* ip, raw_ip& result)
+{
+	sockaddr_storage addr;
+
+	if (is_v6) {
+		sockaddr_in6* addr6 = reinterpret_cast<sockaddr_in6*>(&addr);
+		const int err = uv_ip6_addr(ip, 0, addr6);
+		if (err) {
+			LOGERR(1, "failed to parse IPv6 address " << ip << ", error " << uv_err_name(err));
+			return false;
+		}
+		memcpy(result.data, &addr6->sin6_addr, sizeof(in6_addr));
+	}
+	else {
+		sockaddr_in* addr4 = reinterpret_cast<sockaddr_in*>(&addr);
+		const int err = uv_ip4_addr(ip, 0, addr4);
+		if (err) {
+			LOGERR(1, "failed to parse IPv4 address " << ip << ", error " << uv_err_name(err));
+			return false;
+		}
+		result = {};
+		result.data[10] = 0xFF;
+		result.data[11] = 0xFF;
+		memcpy(result.data + 12, &addr4->sin_addr, sizeof(in_addr));
+	}
+
+	return true;
+}
+
+bool is_localhost(const std::string& host)
+{
+	if (host.empty()) {
+		return false;
+	}
+
+	if (host.compare("localhost") == 0) {
+		return true;
+	}
+
+	if (host.find_first_not_of("0123456789.:") != std::string::npos) {
+		return false;
+	}
+
+	raw_ip addr;
+	if (!str_to_ip(host.find(':') != std::string::npos, host.c_str(), addr)) {
+		return false;
+	}
+
+	return addr.is_localhost();
 }
 
 UV_LoopUserData* GetLoopUserData(uv_loop_t* loop, bool create)

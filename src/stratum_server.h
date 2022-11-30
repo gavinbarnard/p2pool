@@ -103,6 +103,7 @@ private:
 
 	struct BlobsData
 	{
+		uint32_t m_extraNonceStart;
 		std::vector<uint8_t> m_blobs;
 		size_t m_blobSize;
 		uint64_t m_target;
@@ -139,6 +140,9 @@ private:
 		uint64_t m_target;
 		hash m_resultHash;
 		difficulty_type m_sidechainDifficulty;
+		uint64_t m_mainchainHeight;
+		uint64_t m_sidechainHeight;
+		double m_effort;
 		uint64_t m_timestamp;
 		uint64_t m_hashes;
 		bool m_highEnoughDifficulty;
@@ -177,6 +181,8 @@ private:
 
 	void update_hashrate_data(uint64_t hashes, uint64_t timestamp);
 	void api_update_local_stats(uint64_t timestamp);
+
+	void on_shutdown() override;
 };
 
 } // namespace p2pool

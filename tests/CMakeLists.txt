@@ -22,6 +22,7 @@ set(HEADERS
 )
 
 set(SOURCES
+	src/block_template_tests.cpp
 	src/crypto_tests.cpp
 	src/difficulty_type_tests.cpp
 	src/hash_tests.cpp
@@ -55,13 +56,30 @@ set(SOURCES
 	../src/zmq_reader.cpp
 )
 
+if (NOT STATIC_BINARY AND NOT STATIC_LIBS)
+	include(FindCURL)
+endif()
+
+if (CURL_INCLUDE_DIRS)
+	include_directories(${CURL_INCLUDE_DIRS})
+else()
+	include_directories(../external/src/curl/include)
+endif()
+
+if ((CMAKE_CXX_COMPILER_ID MATCHES MSVC) OR STATIC_BINARY OR STATIC_LIBS)
+	set(UV_INCLUDE_DIR ../external/src/libuv/include)
+	set(ZMQ_INCLUDE_DIR ../external/src/libzmq/include)
+else()
+	find_path(UV_INCLUDE_DIR NAMES uv.h PATH_SUFFIXES "include")
+	find_path(ZMQ_INCLUDE_DIR NAMES zmq.h PATH_SUFFIXES "include")
+endif()
+
 include_directories(../src)
 include_directories(../external/src)
 include_directories(../external/src/cryptonote)
-include_directories(../external/src/curl/include)
-include_directories(../external/src/libuv/include)
+include_directories(${UV_INCLUDE_DIR})
 include_directories(../external/src/cppzmq)
-include_directories(../external/src/libzmq/include)
+include_directories(${ZMQ_INCLUDE_DIR})
 include_directories(../external/src/RandomX/src)
 include_directories(../external/src/rapidjson/include)
 include_directories(../external/src/robin-hood-hashing/src/include)
@@ -70,6 +88,9 @@ include_directories(googletest/googletest/include)
 
 if (WIN32)
 	set(LIBS ${LIBS} ws2_32 iphlpapi userenv psapi wldap32)
+	if (CMAKE_CXX_COMPILER_ID MATCHES GNU)
+		set(LIBS ${LIBS} bcrypt)
+	endif()
 	add_definitions(-DCURL_STATICLIB)
 elseif (NOT APPLE)
 	set(LIBS ${LIBS} pthread gss dl)
@@ -90,6 +111,8 @@ else()
 		find_library(UV_LIBRARY NAMES uv_a PATHS "../external/lib/libuv/Release")
 		find_library(CURL_LIBRARY_DEBUG NAMES libcurld PATHS "../external/lib/libcurl/Debug")
 		find_library(CURL_LIBRARY NAMES libcurl PATHS "../external/lib/libcurl/Release")
+		add_definitions(-D_DISABLE_VECTOR_ANNOTATION)
+		add_definitions(-D_DISABLE_STRING_ANNOTATION)
 	elseif (CMAKE_CXX_COMPILER_ID MATCHES GNU OR CMAKE_CXX_COMPILER_ID MATCHES Clang)
 		find_library(ZMQ_LIBRARY_DEBUG NAMES zmq libzmq.a)
 		find_library(ZMQ_LIBRARY NAMES zmq libzmq.a)

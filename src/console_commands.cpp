@@ -117,8 +117,8 @@ static cmd cmds[] = {
 	{ STRCONST("peers"), "", "show all peers", do_showpeers },
 	{ STRCONST("workers"), "", "show all connected workers", do_showworkers },
 	{ STRCONST("bans"), "", "show all banned IPs", do_showbans },
-	{ STRCONST("outpeers"), "", "set maximum number of outgoing connections", do_outpeers },
-	{ STRCONST("inpeers"), "", "set maximum number of incoming connections", do_inpeers },
+	{ STRCONST("outpeers"), "<N>", "set maximum number of outgoing connections", do_outpeers },
+	{ STRCONST("inpeers"), "<N>", "set maximum number of incoming connections", do_inpeers },
 #ifdef WITH_RANDOMX
 	{ STRCONST("start_mining"), "<threads>", "start mining", do_start_mining },
 	{ STRCONST("stop_mining"), "", "stop mining", do_stop_mining },
@@ -131,7 +131,7 @@ static void do_help(p2pool * /* m_pool */, const char * /* args */)
 {
 	LOGINFO(0, "List of commands");
 	for (int i = 0; cmds[i].name.len; ++i) {
-		LOGINFO(0, cmds[i].name.str << " " << cmds[i].arg << "\t" << cmds[i].descr);
+		LOGINFO(0, log::pad_right(cmds[i].name.str, 20) << log::pad_right(cmds[i].arg, 12) << cmds[i].descr);
 	}
 }
 
@@ -161,21 +161,21 @@ static void do_loglevel(p2pool * /* m_pool */, const char *args)
 static void do_addpeers(p2pool *m_pool, const char *args)
 {
 	if (m_pool->p2p_server()) {
-		m_pool->p2p_server()->connect_to_peers(args);
+		m_pool->p2p_server()->connect_to_peers_async(args);
 	}
 }
 
 static void do_droppeers(p2pool *m_pool, const char * /* args */)
 {
 	if (m_pool->p2p_server()) {
-		m_pool->p2p_server()->drop_connections();
+		m_pool->p2p_server()->drop_connections_async();
 	}
 }
 
 static void do_showpeers(p2pool* m_pool, const char* /* args */)
 {
 	if (m_pool->p2p_server()) {
-		m_pool->p2p_server()->show_peers();
+		m_pool->p2p_server()->show_peers_async();
 	}
 }
 
@@ -266,6 +266,19 @@ void ConsoleCommands::stdinReadCallback(uv_stream_t* stream, ssize_t nread, cons
 			for (; c->name.len; ++c) {
 				if (!strncmp(command.c_str(), c->name.str, c->name.len)) {
 					const char* args = (c->name.len + 1 <= k) ? (command.c_str() + c->name.len + 1) : "";
+
+					// Skip spaces
+					while ((args[0] == ' ') || (args[0] == '\t')) {
+						++args;
+					}
+
+					// Check if an argument is required
+					if (strlen(c->arg) && !strlen(args)) {
+						LOGWARN(0, c->name.str << " requires arguments");
+						do_help(nullptr, nullptr);
+						break;
+					}
+
 					c->func(pThis->m_pool, args);
 					break;
 				}
@@ -273,6 +286,7 @@ void ConsoleCommands::stdinReadCallback(uv_stream_t* stream, ssize_t nread, cons
 
 			if (!c->name.len) {
 				LOGWARN(0, "Unknown command " << command.c_str());
+				do_help(nullptr, nullptr);
 			}
 
 			k = command.find_first_not_of("\r\n", k + 1);
@@ -289,9 +303,19 @@ void ConsoleCommands::stdinReadCallback(uv_stream_t* stream, ssize_t nread, cons
 void ConsoleCommands::loop(void* data)
 {
 	LOGINFO(1, "event loop started");
+
 	ConsoleCommands* pThis = static_cast<ConsoleCommands*>(data);
-	uv_run(&pThis->m_loop, UV_RUN_DEFAULT);
-	uv_loop_close(&pThis->m_loop);
+
+	int err = uv_run(&pThis->m_loop, UV_RUN_DEFAULT);
+	if (err) {
+		LOGWARN(1, "uv_run returned " << err);
+	}
+
+	err = uv_loop_close(&pThis->m_loop);
+	if (err) {
+		LOGWARN(1, "uv_loop_close returned error " << uv_err_name(err));
+	}
+
 	LOGINFO(1, "event loop stopped");
 }
 

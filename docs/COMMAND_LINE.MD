@@ -17,12 +17,15 @@
 --no-cache           Disable p2pool.cache
 --no-color           Disable colors in console output
 --no-randomx         Disable internal RandomX hasher: p2pool will use RPC calls to monerod to check PoW hashes
---out-peers N        Maximum number of outgoing connections for p2p server (any value between 10 and 1000)
---in-peers N         Maximum number of incoming connections for p2p server (any value between 10 and 1000)
+--out-peers N        Maximum number of outgoing connections for p2p server (any value between 10 and 450)
+--in-peers N         Maximum number of incoming connections for p2p server (any value between 10 and 450)
 --start-mining N     Start built-in miner using N threads (any value between 1 and 64)
 --mini               Connect to p2pool-mini sidechain. Note that it will also change default p2p port from 37889 to 37888
 --no-autodiff        Disable automatic difficulty adjustment for miners connected to stratum
 --rpc-login          Specify username[:password] required for Monero RPC server
+--socks5             Specify IP:port of a SOCKS5 proxy to use for outgoing connections
+--no-dns             disable DNS queries, use only IP addresses to connect to peers (seed node DNS will be unavailable too)
+--p2p-external-port  port number that your router uses for mapping to your local p2p port. Use it if you are behind a NAT and still want to accept incoming connections
 ```
 
 ### Example command line

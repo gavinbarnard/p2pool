@@ -154,10 +154,13 @@ static FORCEINLINE void derivation_to_scalar(const hash& derivation, size_t outp
 	hash_to_scalar(data, static_cast<int>(p - data), res);
 }
 
-class Cache
+class Cache : public nocopy_nomove
 {
 public:
 	Cache()
+		: derivations(new DerivationsMap())
+		, public_keys(new PublicKeysMap())
+		, tx_keys(new TxKeysMap())
 	{
 		uv_rwlock_init_checked(&derivations_lock);
 		uv_rwlock_init_checked(&public_keys_lock);
@@ -166,6 +169,10 @@ public:
 
 	~Cache()
 	{
+		delete derivations;
+		delete public_keys;
+		delete tx_keys;
+
 		uv_rwlock_destroy(&derivations_lock);
 		uv_rwlock_destroy(&public_keys_lock);
 		uv_rwlock_destroy(&tx_keys_lock);
@@ -180,8 +187,8 @@ public:
 		derivation = {};
 		{
 			ReadLock lock(derivations_lock);
-			auto it = derivations.find(index);
-			if (it != derivations.end()) {
+			auto it = derivations->find(index);
+			if (it != derivations->end()) {
 				const DerivationEntry& entry = it->second;
 				derivation = entry.m_derivation;
 				if (entry.find_view_tag(output_index, view_tag)) {
@@ -210,12 +217,8 @@ public:
 		{
 			WriteLock lock(derivations_lock);
 
-			DerivationEntry& entry = derivations.emplace(index, DerivationEntry{ derivation, {} }).first->second;
-
-			const uint32_t k = static_cast<uint32_t>(output_index << 8) | view_tag;
-			if (std::find(entry.m_viewTags.begin(), entry.m_viewTags.end(), k) == entry.m_viewTags.end()) {
-				entry.m_viewTags.emplace_back(k);
-			}
+			DerivationEntry& entry = derivations->emplace(index, DerivationEntry{ derivation, { 0xFFFFFFFFUL, 0xFFFFFFFFUL }, {} }).first->second;
+			entry.add_view_tag(static_cast<uint32_t>(output_index << 8) | view_tag);
 		}
 
 		return true;
@@ -230,8 +233,8 @@ public:
 
 		{
 			ReadLock lock(public_keys_lock);
-			auto it = public_keys.find(index);
-			if (it != public_keys.end()) {
+			auto it = public_keys->find(index);
+			if (it != public_keys->end()) {
 				derived_key = it->second;
 				return true;
 			}
@@ -257,7 +260,7 @@ public:
 
 		{
 			WriteLock lock(public_keys_lock);
-			public_keys.emplace(index, derived_key);
+			public_keys->emplace(index, derived_key);
 		}
 
 		return true;
@@ -271,8 +274,8 @@ public:
 
 		{
 			ReadLock lock(tx_keys_lock);
-			auto it = tx_keys.find(index);
-			if (it != tx_keys.end()) {
+			auto it = tx_keys->find(index);
+			if (it != tx_keys->end()) {
 				pub = it->second.first;
 				sec = it->second.second;
 				return;
@@ -291,25 +294,54 @@ public:
 
 		{
 			WriteLock lock(tx_keys_lock);
-			tx_keys.emplace(index, std::pair<hash, hash>(pub, sec));
+			tx_keys->emplace(index, std::pair<hash, hash>(pub, sec));
 		}
 	}
 
 	void clear()
 	{
-		{ WriteLock lock(derivations_lock); derivations.clear(); }
-		{ WriteLock lock(public_keys_lock); public_keys.clear(); }
-		{ WriteLock lock(tx_keys_lock); tx_keys.clear(); }
+		{
+			WriteLock lock(derivations_lock);
+			delete derivations;
+			derivations = new DerivationsMap();
+			derivations->reserve(5000);
+		}
+		{
+			WriteLock lock(public_keys_lock);
+			delete public_keys;
+			public_keys = new PublicKeysMap();
+			public_keys->reserve(5000);
+		}
+		{
+			WriteLock lock(tx_keys_lock);
+			delete tx_keys;
+			tx_keys = new TxKeysMap();
+			tx_keys->reserve(50);
+		}
 	}
 
 private:
 	struct DerivationEntry
 	{
 		hash m_derivation;
-		std::vector<uint32_t> m_viewTags;
+		uint32_t m_viewTags1[2] = { 0xFFFFFFFFUL, 0xFFFFFFFFUL };
+		std::vector<uint32_t> m_viewTags2;
 
-		bool find_view_tag(size_t output_index, uint8_t& view_tag) const {
-			for (uint32_t k : m_viewTags) {
+		FORCEINLINE bool find_view_tag(size_t output_index, uint8_t& view_tag) const
+		{
+#define ITER(i) do { \
+				const uint32_t k = m_viewTags1[i]; \
+				if ((k >> 8) == output_index) { \
+					view_tag = static_cast<uint8_t>(k); \
+					return true; \
+				} \
+			} while(0)
+
+			ITER(0);
+			ITER(1);
+#undef ITER
+
+			for (const uint32_t k : m_viewTags2) {
 				if ((k >> 8) == output_index) {
 					view_tag = static_cast<uint8_t>(k);
 					return true;
@@ -317,16 +349,42 @@ private:
 			}
 			return false;
 		}
+
+		FORCEINLINE void add_view_tag(uint32_t k)
+		{
+#define ITER(i) do { \
+				const uint32_t t = m_viewTags1[i]; \
+				if (t == 0xFFFFFFFFUL) { \
+					m_viewTags1[i] = k; \
+					return; \
+				} \
+				else if (t == k) { \
+					return; \
+				} \
+			} while (0)
+
+			ITER(0);
+			ITER(1);
+#undef ITER
+
+			if (std::find(m_viewTags2.begin(), m_viewTags2.end(), k) == m_viewTags2.end()) {
+				m_viewTags2.emplace_back(k);
+			}
+		}
 	};
 
+	typedef unordered_map<std::array<uint8_t, HASH_SIZE * 2>, DerivationEntry> DerivationsMap;
+	typedef unordered_map<std::array<uint8_t, HASH_SIZE * 2 + sizeof(size_t)>, hash> PublicKeysMap;
+	typedef unordered_map<std::array<uint8_t, HASH_SIZE * 2>, std::pair<hash, hash>> TxKeysMap;
+
 	uv_rwlock_t derivations_lock;
-	unordered_map<std::array<uint8_t, HASH_SIZE * 2>, DerivationEntry> derivations;
+	DerivationsMap* derivations;
 
 	uv_rwlock_t public_keys_lock;
-	unordered_map<std::array<uint8_t, HASH_SIZE * 2 + sizeof(size_t)>, hash> public_keys;
+	PublicKeysMap* public_keys;
 
 	uv_rwlock_t tx_keys_lock;
-	unordered_map<std::array<uint8_t, HASH_SIZE * 2>, std::pair<hash, hash>> tx_keys;
+	TxKeysMap* tx_keys;
 };
 
 static Cache* cache = nullptr;
@@ -379,7 +437,9 @@ void destroy_crypto_cache()
 
 void clear_crypto_cache()
 {
-	cache->clear();
+	if (cache) {
+		cache->clear();
+	}
 }
 
 } // namespace p2pool

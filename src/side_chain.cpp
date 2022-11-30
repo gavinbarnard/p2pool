@@ -32,6 +32,7 @@
 #include "stratum_server.h"
 #include "params.h"
 #include "json_parsers.h"
+#include "crypto.h"
 #include <rapidjson/document.h>
 #include <rapidjson/istreamwrapper.h>
 #include <fstream>
@@ -169,7 +170,11 @@ SideChain::SideChain(p2pool* pool, NetworkType type, const char* pool_name)
 
 	// Use between 1 and 8 threads
 	if (numThreads < 1) numThreads = 1;
+
+	// Don't limit thread count when debugging because debug builds are slow
+#ifndef P2POOL_DEBUGGING
 	if (numThreads > 8) numThreads = 8;
+#endif
 
 	LOGINFO(4, "running " << numThreads << " pre-calculation workers");
 
@@ -320,7 +325,7 @@ bool SideChain::get_shares(const PoolBlock* tip, std::vector<MinerShare>& shares
 	uint64_t block_depth = 0;
 	const PoolBlock* cur = tip;
 	do {
-		MinerShare cur_share{ cur->m_difficulty.lo, &cur->m_minerWallet };
+		MinerShare cur_share{ cur->m_difficulty, &cur->m_minerWallet };
 
 		for (const hash& uncle_id : cur->m_uncles) {
 			auto it = m_blocksById.find(uncle_id);
@@ -338,14 +343,9 @@ bool SideChain::get_shares(const PoolBlock* tip, std::vector<MinerShare>& shares
 			}
 
 			// Take some % of uncle's weight into this share
-			uint64_t product[2];
-			product[0] = umul128(uncle->m_difficulty.lo, m_unclePenalty, &product[1]);
-
-			uint64_t rem;
-			const uint64_t uncle_penalty = udiv128(product[1], product[0], 100, &rem);
-
+			const difficulty_type uncle_penalty = uncle->m_difficulty * m_unclePenalty / 100;
 			cur_share.m_weight += uncle_penalty;
-			shares.emplace_back(uncle->m_difficulty.lo - uncle_penalty, &uncle->m_minerWallet);
+			shares.emplace_back(uncle->m_difficulty - uncle_penalty, &uncle->m_minerWallet);
 		}
 
 		shares.push_back(cur_share);
@@ -448,19 +448,19 @@ bool SideChain::block_seen(const PoolBlock& block)
 
 	// Check if it was received before
 	MutexLock lock(m_seenBlocksLock);
-	return !m_seenBlocks.insert(block.m_sidechainId).second;
+	return !m_seenBlocks.insert(block.get_full_id()).second;
 }
 
 void SideChain::unsee_block(const PoolBlock& block)
 {
 	MutexLock lock(m_seenBlocksLock);
-	m_seenBlocks.erase(block.m_sidechainId);
+	m_seenBlocks.erase(block.get_full_id());
 }
 
 bool SideChain::add_external_block(PoolBlock& block, std::vector<hash>& missing_blocks)
 {
 	if (block.m_difficulty < m_minDifficulty) {
-		LOGWARN(3, "add_external_block: block has invalid difficulty " << block.m_difficulty << ", expected >= " << m_minDifficulty);
+		LOGWARN(3, "add_external_block: block mined by " << block.m_minerWallet << " has invalid difficulty " << block.m_difficulty << ", expected >= " << m_minDifficulty);
 		return false;
 	}
 
@@ -493,7 +493,7 @@ bool SideChain::add_external_block(PoolBlock& block, std::vector<hash>& missing_
 	LOGINFO(4, "add_external_block: height = " << block.m_sidechainHeight << ", id = " << block.m_sidechainId << ", mainchain height = " << block.m_txinGenHeight);
 
 	if (too_low_diff) {
-		LOGWARN(4, "add_external_block: block has too low difficulty " << block.m_difficulty << ", expected >= ~" << expected_diff << ". Ignoring it.");
+		LOGWARN(4, "add_external_block: block mined by " << block.m_minerWallet << " has too low difficulty " << block.m_difficulty << ", expected >= ~" << expected_diff << ". Ignoring it.");
 		return true;
 	}
 
@@ -501,7 +501,7 @@ bool SideChain::add_external_block(PoolBlock& block, std::vector<hash>& missing_
 	ChainMain data;
 	if (m_pool->chainmain_get_by_hash(block.m_prevId, data)) {
 		if (data.height + 1 != block.m_txinGenHeight) {
-			LOGWARN(3, "add_external_block: wrong mainchain height " << block.m_txinGenHeight << ", expected " << data.height + 1);
+			LOGWARN(3, "add_external_block mined by " << block.m_minerWallet << ": wrong mainchain height " << block.m_txinGenHeight << ", expected " << data.height + 1);
 			return false;
 		}
 	}
@@ -511,7 +511,7 @@ bool SideChain::add_external_block(PoolBlock& block, std::vector<hash>& missing_
 
 	hash seed;
 	if (!m_pool->get_seed(block.m_txinGenHeight, seed)) {
-		LOGWARN(3, "add_external_block: couldn't get seed hash for mainchain height " << block.m_txinGenHeight);
+		LOGWARN(3, "add_external_block mined by " << block.m_minerWallet << ": couldn't get seed hash for mainchain height " << block.m_txinGenHeight);
 		unsee_block(block);
 		return false;
 	}
@@ -527,7 +527,7 @@ bool SideChain::add_external_block(PoolBlock& block, std::vector<hash>& missing_
 	MinerData miner_data = m_pool->miner_data();
 	if ((block.m_prevId == miner_data.prev_id) && miner_data.difficulty.check_pow(pow_hash)) {
 		LOGINFO(0, log::LightGreen() << "add_external_block: block " << block.m_sidechainId << " has enough PoW for Monero network, submitting it");
-		m_pool->submit_block_async(block.m_mainChainData);
+		m_pool->submit_block_async(block.serialize_mainchain_data());
 	}
 	else {
 		difficulty_type diff;
@@ -536,12 +536,12 @@ bool SideChain::add_external_block(PoolBlock& block, std::vector<hash>& missing_
 		}
 		else if (diff.check_pow(pow_hash)) {
 			LOGINFO(0, log::LightGreen() << "add_external_block: block " << block.m_sidechainId << " has enough PoW for Monero height " << block.m_txinGenHeight << ", submitting it");
-			m_pool->submit_block_async(block.m_mainChainData);
+			m_pool->submit_block_async(block.serialize_mainchain_data());
 		}
 	}
 
 	if (!block.m_difficulty.check_pow(pow_hash)) {
-		LOGWARN(3, "add_external_block: not enough PoW for height = " << block.m_sidechainHeight << ", mainchain height " << block.m_txinGenHeight);
+		LOGWARN(3, "add_external_block mined by " << block.m_minerWallet << ": not enough PoW for height = " << block.m_sidechainHeight << ", mainchain height " << block.m_txinGenHeight);
 		return false;
 	}
 
@@ -574,7 +574,7 @@ bool SideChain::add_external_block(PoolBlock& block, std::vector<hash>& missing_
 	}
 
 	if (block_found) {
-		m_pool->api_update_block_found(&data);
+		m_pool->api_update_block_found(&data, &block);
 	}
 
 	add_block(block);
@@ -599,10 +599,20 @@ void SideChain::add_block(const PoolBlock& block)
 
 	auto result = m_blocksById.insert({ new_block->m_sidechainId, new_block });
 	if (!result.second) {
-		LOGWARN(3, "add_block: trying to add the same block twice, id = "
-			<< new_block->m_sidechainId << ", sidechain height = "
-			<< new_block->m_sidechainHeight << ", height = "
-			<< new_block->m_txinGenHeight);
+		const PoolBlock* old_block = result.first->second;
+
+		LOGWARN(3, "add_block: trying to add the same block twice:"
+			<< "\nnew block id = " << new_block->m_sidechainId
+			<< ", sidechain height = " << new_block->m_sidechainHeight
+			<< ", height = " << new_block->m_txinGenHeight
+			<< ", nonce = " << new_block->m_nonce
+			<< ", extra_nonce = " << new_block->m_extraNonce
+			<< "\nold block id = " << old_block->m_sidechainId
+			<< ", sidechain height = " << old_block->m_sidechainHeight
+			<< ", height = " << old_block->m_txinGenHeight
+			<< ", nonce = " << old_block->m_nonce
+			<< ", extra_nonce = " << old_block->m_extraNonce
+		);
 
 		delete new_block;
 		return;
@@ -675,10 +685,10 @@ bool SideChain::get_block_blob(const hash& id, std::vector<uint8_t>& blob) const
 		return false;
 	}
 
-	blob.reserve(block->m_mainChainData.size() + block->m_sideChainData.size());
+	blob = block->serialize_mainchain_data();
+	const std::vector<uint8_t> sidechain_data = block->serialize_sidechain_data();
+	blob.insert(blob.end(), sidechain_data.begin(), sidechain_data.end());
 
-	blob = block->m_mainChainData;
-	blob.insert(blob.end(), block->m_sideChainData.begin(), block->m_sideChainData.end());
 	return true;
 }
 
@@ -686,35 +696,38 @@ bool SideChain::get_outputs_blob(PoolBlock* block, uint64_t total_reward, std::v
 {
 	blob.clear();
 
-	ReadLock lock(m_sidechainLock);
-
-	auto it = m_blocksById.find(block->m_sidechainId);
-	if (it != m_blocksById.end()) {
-		PoolBlock* b = it->second;
-		const size_t n = b->m_outputs.size();
-
-		blob.reserve(n * 39 + 64);
-		writeVarint(n, blob);
-
-		for (const PoolBlock::TxOutput& output : b->m_outputs) {
-			writeVarint(output.m_reward, blob);
-			blob.emplace_back(output.m_txType);
-			blob.insert(blob.end(), output.m_ephPublicKey.h, output.m_ephPublicKey.h + HASH_SIZE);
-
-			if (output.m_txType == TXOUT_TO_TAGGED_KEY) {
-				blob.emplace_back(output.m_viewTag);
-			}
-		}
-
-		block->m_outputs = b->m_outputs;
-		return true;
-	}
-
 	std::vector<MinerShare> tmpShares;
 	std::vector<uint64_t> tmpRewards;
+	{
+		ReadLock lock(m_sidechainLock);
 
-	if (!get_shares(block, tmpShares) || !split_reward(total_reward, tmpShares, tmpRewards) || (tmpRewards.size() != tmpShares.size())) {
-		return false;
+		auto it = m_blocksById.find(block->m_sidechainId);
+		if (it != m_blocksById.end()) {
+			PoolBlock* b = it->second;
+			const size_t n = b->m_outputs.size();
+
+			blob.reserve(n * 39 + 64);
+			writeVarint(n, blob);
+
+			const uint8_t tx_type = b->get_tx_type();
+
+			for (const PoolBlock::TxOutput& output : b->m_outputs) {
+				writeVarint(output.m_reward, blob);
+				blob.emplace_back(tx_type);
+				blob.insert(blob.end(), output.m_ephPublicKey.h, output.m_ephPublicKey.h + HASH_SIZE);
+
+				if (tx_type == TXOUT_TO_TAGGED_KEY) {
+					blob.emplace_back(static_cast<uint8_t>(output.m_viewTag));
+				}
+			}
+
+			block->m_outputs = b->m_outputs;
+			return true;
+		}
+
+		if (!get_shares(block, tmpShares) || !split_reward(total_reward, tmpShares, tmpRewards) || (tmpRewards.size() != tmpShares.size())) {
+			return false;
+		}
 	}
 
 	const size_t n = tmpShares.size();
@@ -727,7 +740,17 @@ bool SideChain::get_outputs_blob(PoolBlock* block, uint64_t total_reward, std::v
 	int num_helper_jobs_started = 0;
 
 	if (loop) {
-		constexpr size_t HELPER_JOBS_COUNT = 4;
+		uint32_t HELPER_JOBS_COUNT = std::thread::hardware_concurrency();
+
+		// this thread will also be running, so reduce helper job count by 1
+		if (HELPER_JOBS_COUNT > 0) {
+			--HELPER_JOBS_COUNT;
+		}
+
+		// No more than 8 helper jobs because our UV worker thread pool has 8 threads
+		if (HELPER_JOBS_COUNT > 8) {
+			HELPER_JOBS_COUNT = 8;
+		}
 
 		struct Work
 		{
@@ -758,7 +781,9 @@ bool SideChain::get_outputs_blob(PoolBlock* block, uint64_t total_reward, std::v
 					int index;
 					while ((index = work->counter.fetch_sub(1)) >= 0) {
 						uint8_t view_tag;
-						work->tmpShares[index].m_wallet->get_eph_public_key(work->txkeySec, static_cast<size_t>(index), eph_public_key, view_tag);
+						if (!work->tmpShares[index].m_wallet->get_eph_public_key(work->txkeySec, static_cast<size_t>(index), eph_public_key, view_tag)) {
+							LOGWARN(6, "get_eph_public_key failed at index " << index);
+						}
 					}
 
 					++work->num_helper_jobs_finished;
@@ -808,8 +833,10 @@ bool SideChain::get_outputs_blob(PoolBlock* block, uint64_t total_reward, std::v
 			blob.emplace_back(view_tag);
 		}
 
-		block->m_outputs.emplace_back(tmpRewards[i], eph_public_key, tx_type, view_tag);
+		block->m_outputs.emplace_back(tmpRewards[i], eph_public_key, view_tag);
 	}
+
+	block->m_outputs.shrink_to_fit();
 
 	if (loop) {
 		// this will cause all helper jobs to finish immediately
@@ -911,13 +938,16 @@ void SideChain::print_status(bool obtain_sidechain_lock) const
 		}
 
 		const Wallet& w = m_pool->params().m_wallet;
+		const uint8_t tx_type = tip->get_tx_type();
 
 		hash eph_public_key;
 		for (size_t i = 0, n = tip->m_outputs.size(); i < n; ++i) {
 			const PoolBlock::TxOutput& out = tip->m_outputs[i];
 			if (!your_reward) {
-				if (out.m_txType == TXOUT_TO_TAGGED_KEY) {
-					if (w.get_eph_public_key_with_view_tag(tip->m_txkeySec, i, eph_public_key, out.m_viewTag) && (out.m_ephPublicKey == eph_public_key)) {
+				if (tx_type == TXOUT_TO_TAGGED_KEY) {
+					uint8_t view_tag;
+					const uint8_t expected_view_tag = out.m_viewTag;
+					if (w.get_eph_public_key(tip->m_txkeySec, i, eph_public_key, view_tag, &expected_view_tag) && (out.m_ephPublicKey == eph_public_key)) {
 						your_reward = out.m_reward;
 					}
 				}
@@ -968,6 +998,7 @@ void SideChain::print_status(bool obtain_sidechain_lock) const
 		"\nSide chain hashrate       = " << log::Hashrate(pool_hashrate) <<
 		(hashrate_est ? "\nYour hashrate (pool-side) = " : "") << (hashrate_est ? log::Hashrate(hashrate_est) : log::Hashrate()) <<
 		"\nPPLNS window              = " << total_blocks_in_window << " blocks (+" << total_uncles_in_window << " uncles, " << total_orphans << " orphans)" <<
+		"\nYour wallet address       = " << m_pool->params().m_wallet <<
 		"\nYour shares               = " << our_blocks_in_window_total << " blocks (+" << our_uncles_in_window_total << " uncles, " << our_orphans << " orphans)"
 										 << our_blocks_in_window_chart << our_uncles_in_window_chart <<
 		"\nBlock reward share        = " << block_share << "% (" << log::XMRAmount(your_reward) << ')'
@@ -1022,12 +1053,15 @@ double SideChain::get_reward_share(const Wallet& w) const
 
 		const PoolBlock* tip = m_chainTip;
 		if (tip) {
+			const uint8_t tx_type = tip->get_tx_type();
 			hash eph_public_key;
 			for (size_t i = 0, n = tip->m_outputs.size(); i < n; ++i) {
 				const PoolBlock::TxOutput& out = tip->m_outputs[i];
 				if (!reward) {
-					if (out.m_txType == TXOUT_TO_TAGGED_KEY) {
-						if (w.get_eph_public_key_with_view_tag(tip->m_txkeySec, i, eph_public_key, out.m_viewTag) && (out.m_ephPublicKey == eph_public_key)) {
+					if (tx_type == TXOUT_TO_TAGGED_KEY) {
+						uint8_t view_tag;
+						const uint8_t expected_view_tag = out.m_viewTag;
+						if (w.get_eph_public_key(tip->m_txkeySec, i, eph_public_key, view_tag, &expected_view_tag) && (out.m_ephPublicKey == eph_public_key)) {
 							reward = out.m_reward;
 						}
 					}
@@ -1125,9 +1159,9 @@ bool SideChain::split_reward(uint64_t reward, const std::vector<MinerShare>& sha
 {
 	const size_t num_shares = shares.size();
 
-	const uint64_t total_weight = std::accumulate(shares.begin(), shares.end(), 0ULL, [](uint64_t a, const MinerShare& b) { return a + b.m_weight; });
+	const difficulty_type total_weight = std::accumulate(shares.begin(), shares.end(), difficulty_type(), [](const difficulty_type& a, const MinerShare& b) { return a + b.m_weight; });
 
-	if (total_weight == 0) {
+	if (total_weight.empty()) {
 		LOGERR(1, "total_weight is 0. Check the code!");
 		return false;
 	}
@@ -1136,18 +1170,14 @@ bool SideChain::split_reward(uint64_t reward, const std::vector<MinerShare>& sha
 	rewards.reserve(num_shares);
 
 	// Each miner gets a proportional fraction of the block reward
-	uint64_t w = 0;
+	difficulty_type w;
 	uint64_t reward_given = 0;
 	for (uint64_t i = 0; i < num_shares; ++i) {
 		w += shares[i].m_weight;
 
-		uint64_t hi;
-		const uint64_t lo = umul128(w, reward, &hi);
-
-		uint64_t rem;
-		const uint64_t next_value = udiv128(hi, lo, total_weight, &rem);
-		rewards.emplace_back(next_value - reward_given);
-		reward_given = next_value;
+		const difficulty_type next_value = w * reward / total_weight;
+		rewards.emplace_back(next_value.lo - reward_given);
+		reward_given = next_value.lo;
 	}
 
 	// Double check that we gave out the exact amount
@@ -1242,20 +1272,7 @@ bool SideChain::get_difficulty(const PoolBlock* tip, std::vector<DifficultyData>
 		}
 	}
 
-	// This is correct as long as the difference between two 128-bit difficulties is less than 2^64, even if it wraps
-	const uint64_t delta_diff = diff2.lo - diff1.lo;
-
-	uint64_t product[2];
-	product[0] = umul128(delta_diff, m_targetBlockTime, &product[1]);
-
-	if (product[1] >= delta_t) {
-		LOGERR(1, "calculated difficulty is too high for block at height = " << tip->m_sidechainHeight << ", id = " << tip->m_sidechainId << ", mainchain height = " << tip->m_txinGenHeight);
-		return false;
-	}
-
-	uint64_t rem;
-	curDifficulty.lo = udiv128(product[1], product[0], delta_t, &rem);
-	curDifficulty.hi = 0;
+	curDifficulty = (diff2 - diff1) * m_targetBlockTime / delta_t;
 
 	if (curDifficulty < m_minDifficulty) {
 		curDifficulty = m_minDifficulty;
@@ -1291,7 +1308,7 @@ void SideChain::verify_loop(PoolBlock* block)
 		if (block->m_invalid) {
 			LOGWARN(3, "block at height = " << block->m_sidechainHeight <<
 				", id = " << block->m_sidechainId <<
-				", mainchain height = " << block->m_txinGenHeight << " is invalid");
+				", mainchain height = " << block->m_txinGenHeight << ", mined by " << block->m_minerWallet << " is invalid");
 		}
 		else {
 			LOGINFO(3, "verified block at height = " << block->m_sidechainHeight <<
@@ -1318,7 +1335,10 @@ void SideChain::verify_loop(PoolBlock* block)
 			if (block->m_wantBroadcast && !block->m_broadcasted) {
 				block->m_broadcasted = true;
 				if (server && (block->m_depth < UNCLE_BLOCK_DEPTH)) {
-					server->broadcast(*block);
+					if (m_pool && (block->m_minerWallet == m_pool->params().m_wallet)) {
+						LOGINFO(0, log::Green() << "SHARE ADDED: height = " << block->m_sidechainHeight << ", id = " << block->m_sidechainId << ", mainchain height = " << block->m_txinGenHeight);
+					}
+					server->broadcast(*block, get_parent(block));
 				}
 			}
 
@@ -1609,6 +1629,8 @@ void SideChain::verify(PoolBlock* block)
 		return;
 	}
 
+	const uint8_t tx_type = block->get_tx_type();
+
 	for (size_t i = 0, n = rewards.size(); i < n; ++i) {
 		const PoolBlock::TxOutput& out = block->m_outputs[i];
 
@@ -1632,7 +1654,7 @@ void SideChain::verify(PoolBlock* block)
 			return;
 		}
 
-		if ((out.m_txType == TXOUT_TO_TAGGED_KEY) && (out.m_viewTag != view_tag)) {
+		if ((tx_type == TXOUT_TO_TAGGED_KEY) && (out.m_viewTag != view_tag)) {
 			LOGWARN(3, "block at height = " << block->m_sidechainHeight <<
 				", id = " << block->m_sidechainId <<
 				", mainchain height = " << block->m_txinGenHeight <<
@@ -1693,6 +1715,8 @@ void SideChain::update_chain_tip(const PoolBlock* block)
 					if (s) {
 						s->reset_share_counters();
 					}
+					// Also clear cache because it has data from all old blocks now
+					clear_crypto_cache();
 					LOGINFO(0, log::LightCyan() << "SYNCHRONIZED");
 				}
 			}
@@ -1713,7 +1737,7 @@ void SideChain::update_chain_tip(const PoolBlock* block)
 
 	if (p2pServer() && block->m_wantBroadcast && !block->m_broadcasted) {
 		block->m_broadcasted = true;
-		p2pServer()->broadcast(*block);
+		p2pServer()->broadcast(*block, get_parent(block));
 	}
 }
 
@@ -2189,6 +2213,9 @@ void SideChain::finish_precalc()
 		uv_mutex_destroy(&m_precalcJobsMutex);
 		uv_cond_destroy(&m_precalcJobsCond);
 
+		// Also clear cache because it has data from all old blocks now
+		clear_crypto_cache();
+
 		LOGINFO(4, "pre-calculation workers stopped");
 	}
 	catch (const std::exception& e)
@@ -2200,8 +2227,11 @@ void SideChain::finish_precalc()
 	if (m_pool) {
 		LOGINFO(0, log::LightGreen() << "[DEV] Synchronization finished successfully, stopping P2Pool now");
 		print_status(false);
-		if (m_pool->p2p_server()) {
-			m_pool->p2p_server()->print_status();
+		P2PServer* server = m_pool->p2p_server();
+		if (server) {
+			server->print_status();
+			server->print_bans();
+			server->show_peers_async();
 		}
 		m_pool->stop();
 	}
