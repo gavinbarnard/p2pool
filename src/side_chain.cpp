@@ -1038,6 +1038,125 @@ double SideChain::get_reward_share(const Wallet& w) const
 	return total_reward ? (static_cast<double>(reward) / static_cast<double>(total_reward)) : 0.0;
 }
 
+
+uint32_t SideChain::get_shares_in_window() const
+{
+	std::vector<hash> blocks_in_window;
+	blocks_in_window.reserve(m_chainWindowSize * 9 / 8);
+
+	//if (obtain_sidechain_lock) uv_rwlock_rdlock(&m_sidechainLock);
+	//ON_SCOPE_LEAVE([this, obtain_sidechain_lock]() { if (obtain_sidechain_lock) uv_rwlock_rdunlock(&m_sidechainLock); });
+
+	const PoolBlock* tip = m_chainTip;
+
+	uint64_t block_depth = 0;
+	const PoolBlock* cur = tip;
+	const uint64_t tip_height = tip ? tip->m_sidechainHeight : 0;
+
+	uint32_t total_blocks_in_window = 0;
+	uint32_t total_uncles_in_window = 0;
+
+	// each dot corresponds to m_chainWindowSize / 30 shares, with current values, 2160 / 30 = 72
+	std::array<uint32_t, 30> our_blocks_in_window{};
+	std::array<uint32_t, 30> our_uncles_in_window{};
+
+	while (cur) {
+		blocks_in_window.emplace_back(cur->m_sidechainId);
+		++total_blocks_in_window;
+
+		if (cur->m_minerWallet == m_pool->params().m_wallet) {
+			// this produces an integer division with quotient rounded up, avoids non-whole divisions from overflowing on total_blocks_in_window
+			const size_t window_index = (total_blocks_in_window - 1) / ((m_chainWindowSize + our_blocks_in_window.size() - 1) / our_blocks_in_window.size());
+			our_blocks_in_window[std::min(window_index, our_blocks_in_window.size() - 1)]++; // clamp window_index, even if total_blocks_in_window is not larger than m_chainWindowSize
+		}
+
+		++block_depth;
+		if (block_depth >= m_chainWindowSize) {
+			break;
+		}
+
+		for (const hash& uncle_id : cur->m_uncles) {
+			blocks_in_window.emplace_back(uncle_id);
+			auto it = m_blocksById.find(uncle_id);
+			if (it != m_blocksById.end()) {
+				PoolBlock* uncle = it->second;
+				if (tip_height - uncle->m_sidechainHeight < m_chainWindowSize) {
+					++total_uncles_in_window;
+					if (uncle->m_minerWallet == m_pool->params().m_wallet) {
+						// this produces an integer division with quotient rounded up, avoids non-whole divisions from overflowing on total_blocks_in_window
+						const size_t window_index = (total_blocks_in_window - 1) / ((m_chainWindowSize + our_uncles_in_window.size() - 1) / our_uncles_in_window.size());
+						our_uncles_in_window[std::min(window_index, our_uncles_in_window.size() - 1)]++; // clamp window_index, even if total_blocks_in_window is not larger than m_chainWindowSize
+					}
+				}
+			}
+		}
+
+		cur = get_parent(cur);
+	}
+
+	uint64_t total_orphans = 0;
+	uint64_t our_orphans = 0;
+
+	if (tip) {
+		std::sort(blocks_in_window.begin(), blocks_in_window.end());
+		for (uint64_t i = 0; (i < m_chainWindowSize) && (i <= tip_height); ++i) {
+			auto it = m_blocksByHeight.find(tip_height - i);
+			if (it == m_blocksByHeight.end()) {
+				continue;
+			}
+			for (const PoolBlock* block : it->second) {
+				if (!std::binary_search(blocks_in_window.begin(), blocks_in_window.end(), block->m_sidechainId)) {
+					LOGINFO(4, "orphan block at height " << log::Gray() << block->m_sidechainHeight << log::NoColor() << ": " << log::Gray() << block->m_sidechainId);
+					++total_orphans;
+					if (block->m_minerWallet == m_pool->params().m_wallet) {
+						++our_orphans;
+					}
+				}
+			}
+		}
+	}
+
+	const uint32_t our_blocks_in_window_total = std::accumulate(our_blocks_in_window.begin(), our_blocks_in_window.end(), 0U);
+
+	return our_blocks_in_window_total;
+}
+
+uint64_t SideChain::get_reward(const Wallet& w) const
+{
+	uint64_t reward = 0;
+	uint64_t total_reward = 0;
+	{
+		ReadLock lock(m_sidechainLock);
+
+		const PoolBlock* tip = m_chainTip;
+		if (tip) {
+			const uint8_t tx_type = tip->get_tx_type();
+			hash eph_public_key;
+			for (size_t i = 0, n = tip->m_outputs.size(); i < n; ++i) {
+				const PoolBlock::TxOutput& out = tip->m_outputs[i];
+				if (!reward) {
+					if (tx_type == TXOUT_TO_TAGGED_KEY) {
+						uint8_t view_tag;
+						const uint8_t expected_view_tag = out.m_viewTag;
+						if (w.get_eph_public_key(tip->m_txkeySec, i, eph_public_key, view_tag, &expected_view_tag) && (out.m_ephPublicKey == eph_public_key)) {
+							reward = out.m_reward;
+						}
+					}
+					else {
+						uint8_t view_tag;
+						if (w.get_eph_public_key(tip->m_txkeySec, i, eph_public_key, view_tag) && (out.m_ephPublicKey == eph_public_key)) {
+							reward = out.m_reward;
+						}
+					}
+				}
+				total_reward += out.m_reward;
+			}
+		}
+	}
+	return reward;
+}
+
+
 uint64_t SideChain::network_major_version(uint64_t height)
 {
 	const hardfork_t* hard_forks;
