@@ -25,7 +25,7 @@ static constexpr char log_category_prefix[] = "ZMQReader ";
 namespace p2pool {
 
 ZMQReader::ZMQReader(const std::string& address, uint32_t zmq_port, const std::string& proxy, MinerCallbackHandler* handler)
-	: m_address(address)
+	: m_monitor(nullptr)
 	, m_zmqPort(zmq_port)
 	, m_proxy(proxy)
 	, m_handler(handler)
@@ -38,14 +38,16 @@ ZMQReader::ZMQReader(const std::string& address, uint32_t zmq_port, const std::s
 		m_proxy.clear();
 	}
 
-	for (uint32_t i = m_publisherPort; i < std::numeric_limits<uint16_t>::max(); ++i) {
-		try {
-			m_publisherPort = 0;
+	char addr_buf[log::Stream::BUF_SIZE + 1];
+	addr_buf[0] = '\0';
 
-			char addr[32];
-			snprintf(addr, sizeof(addr), "tcp://127.0.0.1:%u", i);
-			m_publisher.bind(addr);
-			m_publisherPort = static_cast<uint16_t>(i);
+	std::random_device rd;
+	for (uint32_t port = 49152 + (rd() % 16384), i = 0; i < 100; ++i, port = (port < 65535) ? (port + 1) : 49152) {
+		try {
+			log::Stream s(addr_buf);
+			s << "tcp://127.0.0.1:" << port << '\0';
+			m_publisher.bind(addr_buf);
+			m_publisherPort = static_cast<uint16_t>(port);
 			break;
 		}
 		catch (const std::exception& e) {
@@ -58,23 +60,29 @@ ZMQReader::ZMQReader(const std::string& address, uint32_t zmq_port, const std::s
 		throw zmq::error_t(EFSM);
 	}
 
+	LOGINFO(5, "listening on tcp://127.0.0.1:" << m_publisherPort << " for internal communications");
+
 	m_subscriber.set(zmq::sockopt::connect_timeout, 1000);
+
+	std::string addr(addr_buf);
+	if (!connect(addr, false)) {
+		throw zmq::error_t(EFSM);
+	}
 
 	if (!m_proxy.empty()) {
 		m_subscriber.set(zmq::sockopt::socks_proxy, zmq::const_buffer(m_proxy.c_str(), m_proxy.length()));
 	}
 
-	std::string addr = "tcp://" + m_address + ':' + std::to_string(m_zmqPort);
-	if (!connect(addr)) {
+	log::Stream s(addr_buf);
+	s << "tcp://" << address << ':' << m_zmqPort << '\0';
+	addr.assign(addr_buf);
+
+	if (!connect(addr, true)) {
 		throw zmq::error_t(EFSM);
 	}
+	m_address = std::move(addr);
 
 	m_subscriber.set(zmq::sockopt::socks_proxy, zmq::const_buffer());
-
-	addr = "tcp://127.0.0.1:" + std::to_string(m_publisherPort);
-	if (!connect(addr)) {
-		throw zmq::error_t(EFSM);
-	}
 
 	m_subscriber.set(zmq::sockopt::subscribe, "json-full-chain_main");
 	m_subscriber.set(zmq::sockopt::subscribe, "json-full-miner_data");
@@ -82,7 +90,7 @@ ZMQReader::ZMQReader(const std::string& address, uint32_t zmq_port, const std::s
 
 	const int err = uv_thread_create(&m_worker, run_wrapper, this);
 	if (err) {
-		LOGERR(1, "failed to start ZMQ thread, error " << uv_err_name(err));
+		LOGERR(1, "failed to start ZMQ worker thread, error " << uv_err_name(err));
 		throw zmq::error_t(EMTHREAD);
 	}
 }
@@ -91,16 +99,41 @@ ZMQReader::~ZMQReader()
 {
 	LOGINFO(1, "stopping");
 
-	m_finished.exchange(true);
+	stop();
+	uv_thread_join(&m_worker);
+
+	delete m_monitor;
+
+	LOGINFO(1, "stopped");
+}
+
+void ZMQReader::stop()
+{
+	if (m_stopped.exchange(true)) {
+		return;
+	}
 
 	try {
-		const char msg[] = "json-minimal-txpool_add:[]";
-		m_publisher.send(zmq::const_buffer(msg, sizeof(msg) - 1));
-		uv_thread_join(&m_worker);
+		static constexpr char dummy_msg[] = "json-minimal-txpool_add:[]";
+		m_publisher.send(zmq::const_buffer(dummy_msg, sizeof(dummy_msg) - 1));
 	}
 	catch (const std::exception& e) {
 		LOGERR(1, "exception " << e.what());
 	}
+}
+
+void ZMQReader::monitor_thread(void* arg)
+{
+	LOGINFO(1, "monitor thread ready");
+
+	ZMQReader* r = reinterpret_cast<ZMQReader*>(arg);
+
+	do {} while (!r->m_stopped && r->m_monitor->m_connected && r->m_monitor->check_event(-1));
+
+	// If not connected anymore, shut down ZMQReader entirely
+	r->stop();
+
+	LOGINFO(1, "monitor thread stopped");
 }
 
 void ZMQReader::run_wrapper(void* arg)
@@ -111,8 +144,8 @@ void ZMQReader::run_wrapper(void* arg)
 
 void ZMQReader::run()
 {
-	m_threadRunning = true;
-	ON_SCOPE_LEAVE([this]() { m_threadRunning = false; });
+	m_workerThreadRunning = true;
+	ON_SCOPE_LEAVE([this]() { m_workerThreadRunning = false; });
 
 	zmq_msg_t message = {};
 
@@ -122,6 +155,17 @@ void ZMQReader::run()
 			throw zmq::error_t(errno);
 		}
 
+		const int err = uv_thread_create(&m_monitorThread, monitor_thread, this);
+		if (err) {
+			LOGERR(1, "failed to start ZMQ monitor thread, error " << uv_err_name(err));
+			throw zmq::error_t(EMTHREAD);
+		}
+
+		ON_SCOPE_LEAVE([this]() {
+			m_monitor->abort();
+			uv_thread_join(&m_monitorThread);
+		});
+
 		LOGINFO(1, "worker thread ready");
 
 		do {
@@ -130,7 +174,7 @@ void ZMQReader::run()
 				throw zmq::error_t(errno);
 			}
 
-			if (m_finished.load()) {
+			if (m_stopped) {
 				break;
 			}
 
@@ -144,19 +188,20 @@ void ZMQReader::run()
 	zmq_msg_close(&message);
 }
 
-bool ZMQReader::connect(const std::string& address)
+void ZMQReader::Monitor::on_event_connected(const zmq_event_t&, const char* address)
 {
-	struct ConnectMonitor : public zmq::monitor_t
-	{
-		void on_event_connected(const zmq_event_t&, const char* address) ZMQ_OVERRIDE
-		{
-			LOGINFO(1, "connected to " << address);
-			connected = true;
-		}
+	LOGINFO(1, "connected to " << address);
+	m_connected = true;
+}
 
-		bool connected = false;
-	} monitor;
+void ZMQReader::Monitor::on_event_disconnected(const zmq_event_t&, const char* address)
+{
+	LOGERR(1, "disconnected from " << address);
+	m_connected = false;
+}
 
+bool ZMQReader::connect(const std::string& address, bool keep_monitor)
+{
 	static uint64_t id = 0;
 
 	if (!id) {
@@ -164,7 +209,7 @@ bool ZMQReader::connect(const std::string& address)
 		id = (static_cast<uint64_t>(rd()) << 32) | static_cast<uint32_t>(rd());
 	}
 
-	char buf[log::Stream::BUF_SIZE + 1];
+	char buf[64];
 	log::Stream s(buf);
 	s << "inproc://p2pool-connect-mon-" << id << '\0';
 	++id;
@@ -172,14 +217,23 @@ bool ZMQReader::connect(const std::string& address)
 	using namespace std::chrono;
 	const auto start_time = steady_clock::now();
 
-	monitor.init(m_subscriber, buf);
+	Monitor* monitor = new Monitor();
+	monitor->init(m_subscriber, buf);
 	m_subscriber.connect(address);
 
-	while (!monitor.connected && monitor.check_event(-1)) {
+	while (!monitor->m_connected && monitor->check_event(-1)) {
 		if (duration_cast<milliseconds>(steady_clock::now() - start_time).count() >= 1000) {
 			LOGERR(1, "failed to connect to " << address);
+			delete monitor;
 			return false;
 		}
+	}
+
+	if (keep_monitor) {
+		m_monitor = monitor;
+	}
+	else {
+		delete monitor;
 	}
 
 	return true;
@@ -188,7 +242,7 @@ bool ZMQReader::connect(const std::string& address)
 void ZMQReader::parse(char* data, size_t size)
 {
 	char* value = data;
-	char* end = data + size;
+	const char* end = data + size;
 
 	while ((value < end) && (*value != ':')) {
 		++value;
@@ -205,7 +259,7 @@ void ZMQReader::parse(char* data, size_t size)
 	using namespace rapidjson;
 
 	Document doc;
-	if (doc.Parse<kParseCommentsFlag | kParseTrailingCommasFlag>(value, end - value).HasParseError()) {
+	if (doc.Parse(value, end - value).HasParseError()) {
 		LOGWARN(1, "ZeroMQ message failed to parse, skipping it");
 		return;
 	}

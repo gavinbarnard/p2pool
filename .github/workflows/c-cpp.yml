@@ -1,6 +1,13 @@
 name: C/C++ CI
 
-on: [push, pull_request]
+on:
+  push:
+    paths-ignore:
+      - 'docker-compose/**'
+      - 'docs/**'
+      - 'README.md'
+
+  pull_request:
 
 jobs:
   build-ubuntu:
@@ -42,7 +49,10 @@ jobs:
         make -j$(nproc)
 
     - name: Run tests
-      run: cd tests/build && ./p2pool_tests
+      run: |
+        cd tests/build
+        gunzip *.gz
+        ./p2pool_tests
 
     - name: Archive binary
       uses: actions/upload-artifact@v3
@@ -60,7 +70,7 @@ jobs:
       run: |
         sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
         sudo apt update
-        sudo apt install -y git build-essential cmake autoconf libgss-dev gcc-12 g++-12
+        sudo apt install -y git build-essential cmake libgss-dev gcc-12 g++-12
         sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 --slave /usr/bin/g++ g++ /usr/bin/g++-12 --slave /usr/bin/gcov gcov /usr/bin/gcov-12
 
     - name: Checkout repository
@@ -71,9 +81,9 @@ jobs:
     - name: Build libcurl
       run: |
         cd external/src/curl
-        autoreconf -fi
-        ./configure CFLAGS='-Os' --without-ssl --without-hyper --without-zlib --without-brotli --without-zstd --without-default-ssl-backend --without-ca-bundle --without-ca-path --without-ca-fallback --without-libpsl --without-libgsasl --without-librtmp --without-winidn --without-libidn2 --without-nghttp2 --without-ngtcp2 --without-nghttp3 --without-quiche --without-msh3 --without-zsh-functions-dir --without-fish-functions-dir --disable-ftp --disable-file --disable-ldap --disable-ldaps --disable-rtsp --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap --disable-smb --disable-smtp --disable-gopher --disable-mqtt --disable-manual --disable-ntlm --disable-ntlm-wb --disable-tls-srp --disable-unix-sockets --disable-cookies --disable-socketpair --disable-doh --disable-dateparse --disable-netrc --disable-progress-meter --disable-dnsshuffle --disable-hsts --disable-alt-svc --disable-ares
+        cmake . -DCMAKE_C_FLAGS="-Os" -DBUILD_CURL_EXE=OFF -DBUILD_SHARED_LIBS=OFF -DCURL_ZLIB=OFF -DCURL_DISABLE_ALTSVC=ON -DCURL_DISABLE_COOKIES=ON -DCURL_DISABLE_DOH=ON -DCURL_DISABLE_GETOPTIONS=ON -DCURL_DISABLE_HSTS=ON -DCURL_DISABLE_LIBCURL_OPTION=ON -DCURL_DISABLE_MIME=ON -DCURL_DISABLE_NETRC=ON -DCURL_DISABLE_NTLM=ON -DCURL_DISABLE_PARSEDATE=ON -DCURL_DISABLE_PROGRESS_METER=ON -DCURL_DISABLE_SHUFFLE_DNS=ON -DCURL_DISABLE_SOCKETPAIR=ON -DCURL_DISABLE_VERBOSE_STRINGS=ON -DHTTP_ONLY=ON -DCURL_ENABLE_SSL=OFF -DUSE_LIBIDN2=OFF -DCURL_USE_LIBPSL=OFF -DCURL_USE_LIBSSH2=OFF -DENABLE_UNIX_SOCKETS=OFF
         make -j$(nproc)
+        cd lib && mkdir .libs && cp libcurl.a .libs
 
     - name: Build libuv
       run: |
@@ -88,7 +98,7 @@ jobs:
         cd external/src/libzmq
         mkdir build
         cd build
-        cmake .. -DCMAKE_C_FLAGS='-Os' -DCMAKE_CXX_FLAGS='-Os' -DWITH_TLS=OFF -DWITH_LIBSODIUM=OFF -DWITH_LIBBSD=OFF -DBUILD_TESTS=OFF
+        cmake .. -DCMAKE_C_FLAGS='-Os' -DCMAKE_CXX_FLAGS='-Os' -DWITH_TLS=OFF -DWITH_LIBSODIUM=OFF -DWITH_LIBBSD=OFF -DBUILD_TESTS=OFF -DWITH_DOCS=OFF -DENABLE_DRAFTS=OFF -DWITH_PERF_TOOL=OFF
         make -j$(nproc)
 
     - name: Build p2pool
@@ -107,7 +117,10 @@ jobs:
         make -j$(nproc)
 
     - name: Run tests
-      run: cd tests/build && ./p2pool_tests
+      run: |
+        cd tests/build
+        gunzip *.gz
+        ./p2pool_tests
 
     - name: Archive binary
       uses: actions/upload-artifact@v3
@@ -130,7 +143,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt update
-        sudo apt install -y git build-essential cmake autoconf gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
+        sudo apt install -y git build-essential cmake gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
     - name: Checkout repository
       uses: actions/checkout@v3
@@ -140,9 +153,9 @@ jobs:
     - name: Build libcurl
       run: |
         cd external/src/curl
-        autoreconf -fi
-        ./configure --host=aarch64-linux-gnu CFLAGS='-Os' --without-ssl --without-hyper --without-zlib --without-brotli --without-zstd --without-default-ssl-backend --without-ca-bundle --without-ca-path --without-ca-fallback --without-libpsl --without-libgsasl --without-librtmp --without-winidn --without-libidn2 --without-nghttp2 --without-ngtcp2 --without-nghttp3 --without-quiche --without-msh3 --without-zsh-functions-dir --without-fish-functions-dir --disable-ftp --disable-file --disable-ldap --disable-ldaps --disable-rtsp --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap --disable-smb --disable-smtp --disable-gopher --disable-mqtt --disable-manual --disable-ntlm --disable-ntlm-wb --disable-tls-srp --disable-unix-sockets --disable-cookies --disable-socketpair --disable-doh --disable-dateparse --disable-netrc --disable-progress-meter --disable-dnsshuffle --disable-hsts --disable-alt-svc --disable-ares
+        cmake . -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ -DCMAKE_C_FLAGS="-Os" -DBUILD_CURL_EXE=OFF -DBUILD_SHARED_LIBS=OFF -DCURL_ZLIB=OFF -DCURL_DISABLE_ALTSVC=ON -DCURL_DISABLE_COOKIES=ON -DCURL_DISABLE_DOH=ON -DCURL_DISABLE_GETOPTIONS=ON -DCURL_DISABLE_HSTS=ON -DCURL_DISABLE_LIBCURL_OPTION=ON -DCURL_DISABLE_MIME=ON -DCURL_DISABLE_NETRC=ON -DCURL_DISABLE_NTLM=ON -DCURL_DISABLE_PARSEDATE=ON -DCURL_DISABLE_PROGRESS_METER=ON -DCURL_DISABLE_SHUFFLE_DNS=ON -DCURL_DISABLE_SOCKETPAIR=ON -DCURL_DISABLE_VERBOSE_STRINGS=ON -DHTTP_ONLY=ON -DCURL_ENABLE_SSL=OFF -DUSE_LIBIDN2=OFF -DCURL_USE_LIBPSL=OFF -DCURL_USE_LIBSSH2=OFF -DENABLE_UNIX_SOCKETS=OFF
         make -j$(nproc)
+        cd lib && mkdir .libs && cp libcurl.a .libs
 
     - name: Build libuv
       run: |
@@ -157,7 +170,7 @@ jobs:
         cd external/src/libzmq
         mkdir build
         cd build
-        cmake .. -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ -DCMAKE_C_FLAGS='-Os' -DCMAKE_CXX_FLAGS='-Os' -DWITH_TLS=OFF -DWITH_LIBSODIUM=OFF -DWITH_LIBBSD=OFF -DBUILD_TESTS=OFF
+        cmake .. -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ -DCMAKE_C_FLAGS='-Os' -DCMAKE_CXX_FLAGS='-Os' -DWITH_TLS=OFF -DWITH_LIBSODIUM=OFF -DWITH_LIBBSD=OFF -DBUILD_TESTS=OFF -DWITH_DOCS=OFF -DENABLE_DRAFTS=OFF -DWITH_PERF_TOOL=OFF
         make -j$(nproc)
 
     - name: Build p2pool
@@ -178,6 +191,12 @@ jobs:
     timeout-minutes: 45
     runs-on: windows-latest
 
+    strategy:
+      matrix:
+        config:
+          - {c: "gcc", cxx: "g++", flags: ""}
+          - {c: "clang", cxx: "clang++", flags: "-flto -ffunction-sections -fuse-ld=lld -Wno-unused-command-line-argument"}
+
     defaults:
       run:
         shell: msys2 {0}
@@ -192,21 +211,21 @@ jobs:
       uses: eine/setup-msys2@v2
       with:
         update: true
-        install: mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake make autoconf libtool automake
+        install: mingw-w64-x86_64-toolchain mingw-w64-x86_64-clang mingw-w64-x86_64-lld mingw-w64-x86_64-cmake make
 
     - name: Build libcurl
       run: |
         cd external/src/curl
-        autoreconf -fi
-        ./configure CFLAGS='-Os' --without-ssl --without-hyper --without-zlib --without-brotli --without-zstd --without-default-ssl-backend --without-ca-bundle --without-ca-path --without-ca-fallback --without-libpsl --without-libgsasl --without-librtmp --without-winidn --without-libidn2 --without-nghttp2 --without-ngtcp2 --without-nghttp3 --without-quiche --without-msh3 --without-zsh-functions-dir --without-fish-functions-dir --disable-ftp --disable-file --disable-ldap --disable-ldaps --disable-rtsp --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap --disable-smb --disable-smtp --disable-gopher --disable-mqtt --disable-manual --disable-ntlm --disable-ntlm-wb --disable-tls-srp --disable-unix-sockets --disable-cookies --disable-socketpair --disable-doh --disable-dateparse --disable-netrc --disable-progress-meter --disable-dnsshuffle --disable-hsts --disable-alt-svc --disable-ares
+        cmake . -G "Unix Makefiles" -DCMAKE_C_COMPILER=${{ matrix.config.c }} -DCMAKE_C_FLAGS="-Os ${{ matrix.config.flags }}" -DBUILD_CURL_EXE=OFF -DBUILD_SHARED_LIBS=OFF -DCURL_ZLIB=OFF -DCURL_DISABLE_ALTSVC=ON -DCURL_DISABLE_COOKIES=ON -DCURL_DISABLE_DOH=ON -DCURL_DISABLE_GETOPTIONS=ON -DCURL_DISABLE_HSTS=ON -DCURL_DISABLE_LIBCURL_OPTION=ON -DCURL_DISABLE_MIME=ON -DCURL_DISABLE_NETRC=ON -DCURL_DISABLE_NTLM=ON -DCURL_DISABLE_PARSEDATE=ON -DCURL_DISABLE_PROGRESS_METER=ON -DCURL_DISABLE_SHUFFLE_DNS=ON -DCURL_DISABLE_SOCKETPAIR=ON -DCURL_DISABLE_VERBOSE_STRINGS=ON -DHTTP_ONLY=ON -DCURL_ENABLE_SSL=OFF -DUSE_LIBIDN2=OFF -DCURL_USE_LIBPSL=OFF -DCURL_USE_LIBSSH2=OFF -DENABLE_UNIX_SOCKETS=OFF
         make -j$(nproc)
+        cd lib && mkdir .libs && cp libcurl.a .libs
 
     - name: Build libuv
       run: |
         cd external/src/libuv
         mkdir build
         cd build
-        cmake .. -G "Unix Makefiles" -DCMAKE_C_FLAGS='-Os' -DBUILD_TESTING=OFF
+        cmake .. -G "Unix Makefiles" -DCMAKE_C_COMPILER=${{ matrix.config.c }} -DCMAKE_C_FLAGS='-Os ${{ matrix.config.flags }}' -DBUILD_TESTING=OFF
         make -j$(nproc)
 
     - name: Build libzmq
@@ -214,14 +233,14 @@ jobs:
         cd external/src/libzmq
         mkdir build
         cd build
-        cmake .. -G "Unix Makefiles" -DCMAKE_C_FLAGS='-Os' -DCMAKE_CXX_FLAGS='-Os' -DWITH_TLS=OFF -DWITH_LIBSODIUM=OFF -DWITH_LIBBSD=OFF -DBUILD_TESTS=OFF -DZMQ_HAVE_IPC=OFF
+        cmake .. -G "Unix Makefiles" -DCMAKE_C_COMPILER=${{ matrix.config.c }} -DCMAKE_CXX_COMPILER=${{ matrix.config.cxx }} -DCMAKE_C_FLAGS='-Os ${{ matrix.config.flags }}' -DCMAKE_CXX_FLAGS='-Os ${{ matrix.config.flags }}' -DWITH_TLS=OFF -DWITH_LIBSODIUM=OFF -DWITH_LIBBSD=OFF -DBUILD_TESTS=OFF -DZMQ_HAVE_IPC=OFF -DWITH_DOCS=OFF -DENABLE_DRAFTS=OFF -DWITH_PERF_TOOL=OFF
         make -j$(nproc)
 
     - name: Build p2pool
       run: |
         mkdir build
         cd build
-        cmake .. -G "Unix Makefiles" -DSTATIC_LIBS=ON
+        cmake .. -G "Unix Makefiles" -DCMAKE_C_COMPILER=${{ matrix.config.c }} -DCMAKE_CXX_COMPILER=${{ matrix.config.cxx }} -DCMAKE_C_FLAGS="${{ matrix.config.flags }} -Wl,--gc-sections" -DCMAKE_CXX_FLAGS="${{ matrix.config.flags }} -Wl,--gc-sections" -DSTATIC_LIBS=ON
         make -j$(nproc)
 
     - name: Build tests
@@ -229,18 +248,19 @@ jobs:
         cd tests
         mkdir build
         cd build
-        cmake .. -G "Unix Makefiles" -DSTATIC_LIBS=ON
+        cmake .. -G "Unix Makefiles" -DCMAKE_C_COMPILER=${{ matrix.config.c }} -DCMAKE_CXX_COMPILER=${{ matrix.config.cxx }} -DCMAKE_C_FLAGS="${{ matrix.config.flags }} -Wl,--gc-sections" -DCMAKE_CXX_FLAGS="${{ matrix.config.flags }} -Wl,--gc-sections" -DSTATIC_LIBS=ON
         make -j$(nproc)
 
     - name: Run tests
       run: |
         cd tests/build
+        gunzip *.gz
         ./p2pool_tests.exe
 
     - name: Archive binary
       uses: actions/upload-artifact@v3
       with:
-        name: p2pool-msys2.exe
+        name: p2pool-msys2-${{ matrix.config.c }}.exe
         path: build/p2pool.exe
 
   build-windows-msbuild:
@@ -282,6 +302,7 @@ jobs:
     - name: Run tests
       run: |
         cd tests/build/Debug
+        7z x *.gz
         ./p2pool_tests.exe
 
     - name: Archive binary
@@ -292,7 +313,7 @@ jobs:
 
   build-macos:
 
-    timeout-minutes: 15
+    timeout-minutes: 20
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -306,14 +327,14 @@ jobs:
         submodules: recursive
 
     - name: Install dependencies
-      run: HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake autoconf libtool automake
+      run: HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake
 
     - name: Build libcurl
       run: |
         cd external/src/curl
-        autoreconf -fi
-        ./configure CFLAGS='-Os' --without-ssl --without-hyper --without-zlib --without-brotli --without-zstd --without-default-ssl-backend --without-ca-bundle --without-ca-path --without-ca-fallback --without-libpsl --without-libgsasl --without-librtmp --without-winidn --without-libidn2 --without-nghttp2 --without-ngtcp2 --without-nghttp3 --without-quiche --without-msh3 --without-zsh-functions-dir --without-fish-functions-dir --disable-ftp --disable-file --disable-ldap --disable-ldaps --disable-rtsp --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap --disable-smb --disable-smtp --disable-gopher --disable-mqtt --disable-manual --disable-ntlm --disable-ntlm-wb --disable-tls-srp --disable-unix-sockets --disable-cookies --disable-socketpair --disable-doh --disable-dateparse --disable-netrc --disable-progress-meter --disable-dnsshuffle --disable-hsts --disable-alt-svc --disable-ares
+        cmake . -DCMAKE_C_FLAGS="-Os" -DBUILD_CURL_EXE=OFF -DBUILD_SHARED_LIBS=OFF -DCURL_ZLIB=OFF -DCURL_DISABLE_ALTSVC=ON -DCURL_DISABLE_COOKIES=ON -DCURL_DISABLE_DOH=ON -DCURL_DISABLE_GETOPTIONS=ON -DCURL_DISABLE_HSTS=ON -DCURL_DISABLE_LIBCURL_OPTION=ON -DCURL_DISABLE_MIME=ON -DCURL_DISABLE_NETRC=ON -DCURL_DISABLE_NTLM=ON -DCURL_DISABLE_PARSEDATE=ON -DCURL_DISABLE_PROGRESS_METER=ON -DCURL_DISABLE_SHUFFLE_DNS=ON -DCURL_DISABLE_SOCKETPAIR=ON -DCURL_DISABLE_VERBOSE_STRINGS=ON -DHTTP_ONLY=ON -DCURL_ENABLE_SSL=OFF -DUSE_LIBIDN2=OFF -DCURL_USE_LIBPSL=OFF -DCURL_USE_LIBSSH2=OFF -DENABLE_UNIX_SOCKETS=OFF
         make -j3
+        cd lib && mkdir .libs && cp libcurl.a .libs
 
     - name: Build libuv
       run: |
@@ -328,7 +349,7 @@ jobs:
         cd external/src/libzmq
         mkdir build
         cd build
-        cmake .. -DCMAKE_C_FLAGS='-Os' -DCMAKE_CXX_FLAGS='-Os' -DWITH_TLS=OFF -DWITH_LIBSODIUM=OFF -DWITH_LIBBSD=OFF -DBUILD_TESTS=OFF
+        cmake .. -DCMAKE_C_FLAGS='-Os' -DCMAKE_CXX_FLAGS='-Os' -DWITH_TLS=OFF -DWITH_LIBSODIUM=OFF -DWITH_LIBBSD=OFF -DBUILD_TESTS=OFF -DWITH_DOCS=OFF -DENABLE_DRAFTS=OFF -DWITH_PERF_TOOL=OFF
         make -j3
 
     - name: Build p2pool
@@ -349,12 +370,67 @@ jobs:
     - name: Run tests
       run: |
         cd tests/build
+        gunzip *.gz
         ./p2pool_tests
 
     - name: Archive binary
       uses: actions/upload-artifact@v3
       with:
         name: p2pool-${{ matrix.os }}
+        path: build/p2pool
+
+  build-macos-aarch64:
+
+    timeout-minutes: 15
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [macos-11, macos-12]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake
+
+    - name: Build libcurl
+      run: |
+        cd external/src/curl
+        cmake . -DCMAKE_C_FLAGS='-Os -target arm64-apple-${{ matrix.os }}' -DBUILD_CURL_EXE=OFF -DBUILD_SHARED_LIBS=OFF -DCURL_ZLIB=OFF -DCURL_DISABLE_ALTSVC=ON -DCURL_DISABLE_COOKIES=ON -DCURL_DISABLE_DOH=ON -DCURL_DISABLE_GETOPTIONS=ON -DCURL_DISABLE_HSTS=ON -DCURL_DISABLE_LIBCURL_OPTION=ON -DCURL_DISABLE_MIME=ON -DCURL_DISABLE_NETRC=ON -DCURL_DISABLE_NTLM=ON -DCURL_DISABLE_PARSEDATE=ON -DCURL_DISABLE_PROGRESS_METER=ON -DCURL_DISABLE_SHUFFLE_DNS=ON -DCURL_DISABLE_SOCKETPAIR=ON -DCURL_DISABLE_VERBOSE_STRINGS=ON -DHTTP_ONLY=ON -DCURL_ENABLE_SSL=OFF -DUSE_LIBIDN2=OFF -DCURL_USE_LIBPSL=OFF -DCURL_USE_LIBSSH2=OFF -DENABLE_UNIX_SOCKETS=OFF
+        make -j3
+        cd lib && mkdir .libs && cp libcurl.a .libs
+
+    - name: Build libuv
+      run: |
+        cd external/src/libuv
+        mkdir build
+        cd build
+        cmake .. -DCMAKE_C_FLAGS='-Os -target arm64-apple-${{ matrix.os }}' -DBUILD_TESTING=OFF
+        make -j3
+
+    - name: Build libzmq
+      run: |
+        cd external/src/libzmq
+        mkdir build
+        cd build
+        cmake .. -DCMAKE_C_FLAGS='-Os -target arm64-apple-${{ matrix.os }}' -DCMAKE_CXX_FLAGS='-Os -target arm64-apple-${{ matrix.os }}' -DWITH_TLS=OFF -DWITH_LIBSODIUM=OFF -DWITH_LIBBSD=OFF -DBUILD_TESTS=OFF -DWITH_DOCS=OFF -DENABLE_DRAFTS=OFF -DWITH_PERF_TOOL=OFF
+        make -j3
+
+    - name: Build p2pool
+      run: |
+        mkdir build
+        cd build
+        cmake .. -DCMAKE_C_FLAGS='-target arm64-apple-${{ matrix.os }}' -DCMAKE_CXX_FLAGS='-target arm64-apple-${{ matrix.os }}' -DSTATIC_BINARY=ON -DARCH_ID=aarch64
+        make -j3
+
+    - name: Archive binary
+      uses: actions/upload-artifact@v3
+      with:
+        name: p2pool-${{ matrix.os }}-aarch64
         path: build/p2pool
 
   build-freebsd:
@@ -384,12 +460,12 @@ jobs:
         version: ${{ matrix.os.version }}
         shell: bash
         run: |
-          sudo pkg install -y cmake autoconf automake libtool
+          sudo pkg install -y cmake
           cd external/src/curl
-          autoreconf -fi
-          ./configure CFLAGS='-Os' --without-ssl --without-hyper --without-zlib --without-brotli --without-zstd --without-default-ssl-backend --without-ca-bundle --without-ca-path --without-ca-fallback --without-libpsl --without-libgsasl --without-librtmp --without-winidn --without-libidn2 --without-nghttp2 --without-ngtcp2 --without-nghttp3 --without-quiche --without-msh3 --without-zsh-functions-dir --without-fish-functions-dir --disable-ftp --disable-file --disable-ldap --disable-ldaps --disable-rtsp --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap --disable-smb --disable-smtp --disable-gopher --disable-mqtt --disable-manual --disable-ntlm --disable-ntlm-wb --disable-tls-srp --disable-unix-sockets --disable-cookies --disable-socketpair --disable-doh --disable-dateparse --disable-netrc --disable-progress-meter --disable-dnsshuffle --disable-hsts --disable-alt-svc --disable-ares
+          cmake . -DCMAKE_C_FLAGS="-Os" -DBUILD_CURL_EXE=OFF -DBUILD_SHARED_LIBS=OFF -DCURL_ZLIB=OFF -DCURL_DISABLE_ALTSVC=ON -DCURL_DISABLE_COOKIES=ON -DCURL_DISABLE_DOH=ON -DCURL_DISABLE_GETOPTIONS=ON -DCURL_DISABLE_HSTS=ON -DCURL_DISABLE_LIBCURL_OPTION=ON -DCURL_DISABLE_MIME=ON -DCURL_DISABLE_NETRC=ON -DCURL_DISABLE_NTLM=ON -DCURL_DISABLE_PARSEDATE=ON -DCURL_DISABLE_PROGRESS_METER=ON -DCURL_DISABLE_SHUFFLE_DNS=ON -DCURL_DISABLE_SOCKETPAIR=ON -DCURL_DISABLE_VERBOSE_STRINGS=ON -DHTTP_ONLY=ON -DCURL_ENABLE_SSL=OFF -DUSE_LIBIDN2=OFF -DCURL_USE_LIBPSL=OFF -DCURL_USE_LIBSSH2=OFF -DENABLE_UNIX_SOCKETS=OFF
           make -j2
-          cd ../libuv
+          cd lib && mkdir .libs && cp libcurl.a .libs
+          cd ../../libuv
           mkdir build
           cd build
           cmake .. -DCMAKE_C_FLAGS='-Os' -DBUILD_TESTING=OFF
@@ -397,7 +473,7 @@ jobs:
           cd ../../libzmq
           mkdir build
           cd build
-          cmake .. -DCMAKE_C_FLAGS='-Os' -DCMAKE_CXX_FLAGS='-Os' -DWITH_TLS=OFF -DWITH_LIBSODIUM=OFF -DWITH_LIBBSD=OFF -DBUILD_TESTS=OFF
+          cmake .. -DCMAKE_C_FLAGS='-Os' -DCMAKE_CXX_FLAGS='-Os' -DWITH_TLS=OFF -DWITH_LIBSODIUM=OFF -DWITH_LIBBSD=OFF -DBUILD_TESTS=OFF -DWITH_DOCS=OFF -DENABLE_DRAFTS=OFF -DWITH_PERF_TOOL=OFF
           make -j2
           cd ../../../..
           mkdir build
@@ -409,6 +485,7 @@ jobs:
           cd build
           cmake .. -DSTATIC_LIBS=ON
           make -j2
+          gunzip *.gz
           ./p2pool_tests
 
     - name: Archive binary
@@ -452,6 +529,7 @@ jobs:
           mkdir build && cd build
           cmake ..
           make -j2
+          gunzip *.gz
           ./p2pool_tests
 
     - name: Archive binary

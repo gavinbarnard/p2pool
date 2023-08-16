@@ -1,14 +1,29 @@
 name: cppcheck
 
-on: [push, pull_request]
+on:
+  push:
+    paths-ignore:
+      - 'docker-compose/**'
+      - 'docs/**'
+      - 'README.md'
+
+  pull_request:
+
+  schedule:
+    - cron: '57 0 * * *'
 
 jobs:
   cppcheck-ubuntu:
 
-    timeout-minutes: 30
+    timeout-minutes: 50
     runs-on: ubuntu-latest
 
     steps:
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y libuv1-dev libzmq3-dev libcurl4-openssl-dev
+
     - name: Checkout repository
       uses: actions/checkout@v3
       with:
@@ -25,14 +40,27 @@ jobs:
         cd cppcheck-main
         make -j$(nproc) cppcheck
 
+    - name: cmake p2pool
+      run: |
+        mkdir build
+        cd build
+        cmake .. -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DSTATIC_LIBS=ON
+        python ../cppcheck/remove_external.py compile_commands.json
+
     - name: Run cppcheck
       run: |
         cd cppcheck
         ./run.sh
 
+    - name: Archive full error list
+      uses: actions/upload-artifact@v3
+      with:
+        name: errors_full-linux
+        path: cppcheck/errors_full.txt
+
   cppcheck-windows:
 
-    timeout-minutes: 20
+    timeout-minutes: 50
     runs-on: windows-latest
 
     steps:
@@ -59,9 +87,15 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake .. -G "Visual Studio 17 2022"
+        cmake .. -G "Visual Studio 17 2022" -DSTATIC_LIBS=ON
 
     - name: Run cppcheck
       run: |
         cd cppcheck
         ./run.cmd
+
+    - name: Archive full error list
+      uses: actions/upload-artifact@v3
+      with:
+        name: errors_full-windows
+        path: cppcheck/errors_full.txt

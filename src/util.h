@@ -35,7 +35,7 @@
 namespace p2pool {
 
 #define P2POOL_VERSION_MAJOR 3
-#define P2POOL_VERSION_MINOR 2
+#define P2POOL_VERSION_MINOR 5
 
 extern const char* VERSION;
 
@@ -275,10 +275,40 @@ struct PerfTimer
 #define PERFLOG(level, name) PerfTimer CONCAT(perf_timer_, __LINE__)(level, name)
 #endif
 
+template<typename R, typename ...Args>
+struct Callback
+{
+	struct Base
+	{
+		virtual ~Base() {}
+		virtual R operator()(Args...) = 0;
+	};
+
+	template<typename T>
+	struct Derived : public Base
+	{
+		explicit FORCEINLINE Derived(T&& cb) : m_cb(std::move(cb)) {}
+		R operator()(Args... args) override { return m_cb(args...); }
+
+	private:
+		Derived& operator=(Derived&&) = delete;
+		T m_cb;
+	};
+};
+
+bool get_dns_txt_records_base(const std::string& host, Callback<void, const char*, size_t>::Base&& callback);
+
+template<typename T>
+FORCEINLINE bool get_dns_txt_records(const std::string& host, T&& callback) { return get_dns_txt_records_base(host, Callback<void, const char*, size_t>::Derived<T>(std::move(callback))); }
+
+#ifdef DEV_TRACK_MEMORY
+void show_top_10_allocations();
+#endif
+
 } // namespace p2pool
 
 void memory_tracking_start();
-void memory_tracking_stop();
+bool memory_tracking_stop();
 void p2pool_usage();
 void p2pool_version();
 

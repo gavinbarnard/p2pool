@@ -18,11 +18,12 @@
 #include "common.h"
 
 // Simple memory leak detector for Windows users, works best in RelWithDebInfo configuration.
-#if defined(_WIN32) && 0
+#if defined(_WIN32) && defined(DEV_TRACK_MEMORY)
 
 #include "uv_util.h"
 #include <atomic>
 #include <type_traits>
+#include <iostream>
 
 #include <DbgHelp.h>
 
@@ -87,7 +88,7 @@ uint32_t num_allocations = 0;
 uint64_t total_allocated = 0;
 uint32_t cur_allocation_index = 1;
 
-void show_top_10()
+void show_top_10_allocations()
 {
 	TrackedAllocation* buf = reinterpret_cast<TrackedAllocation*>(VirtualAlloc(nullptr, sizeof(TrackedAllocation) * N, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
 	if (!buf) {
@@ -122,13 +123,16 @@ void show_top_10()
 
 		std::sort(buf, end, [](const auto& a, const auto& b) { return a.allocated_size > b.allocated_size; });
 
-		printf("%I64u total bytes allocated\n", total_allocated);
+		printf("%I64u total bytes allocated\n\n", total_allocated);
+		printf("Top 10 allocations:\n\n");
 
 		for (TrackedAllocation* p = buf; (p < buf + 10) && (p < end); ++p) {
 			printf("%I64u bytes allocated at:\n", p->allocated_size);
 			p->print(h);
 		}
 	}
+
+	printf("\n");
 
 	VirtualFree(buf, 0, MEM_RELEASE);
 }
@@ -263,6 +267,9 @@ void* calloc_hook(size_t count, size_t size) noexcept
 
 void memory_tracking_start()
 {
+	// Trigger std::ostream initialization to avoid reporting it as leaks
+	std::cout << "Memory leak detection = " << 1 << std::endl;
+
 	SymInitialize(GetCurrentProcess(), NULL, TRUE);
 
 	using namespace p2pool;
@@ -272,7 +279,7 @@ void memory_tracking_start()
 	track_memory = true;
 }
 
-void memory_tracking_stop()
+bool memory_tracking_stop()
 {
 	using namespace p2pool;
 
@@ -296,8 +303,13 @@ void memory_tracking_stop()
 	if (total_leaks > 0) {
 		printf("%I64u bytes leaked\n\n", total_leaks);
 	}
+	else {
+		printf("No memory leaks detected\n\n");
+	}
 
 	SymCleanup(h);
+
+	return (total_leaks == 0);
 }
 
 NOINLINE void* operator new(size_t n) { return p2pool::allocate(n); }
@@ -313,7 +325,7 @@ NOINLINE void operator delete[](void* p, size_t) noexcept { p2pool::free_hook(p)
 // cppcheck-suppress functionStatic
 void memory_tracking_start() {}
 // cppcheck-suppress functionStatic
-void memory_tracking_stop() {}
+bool memory_tracking_stop() { return true; }
 
 namespace p2pool {
 

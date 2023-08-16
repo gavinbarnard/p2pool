@@ -25,19 +25,21 @@
 #include "miner.h"
 #endif
 #include "side_chain.h"
+#include "p2pool_api.h"
+#include "params.h"
 
 static constexpr char log_category_prefix[] = "ConsoleCommands ";
+
+static constexpr int DEFAULT_BACKLOG = 1;
 
 namespace p2pool {
 
 ConsoleCommands::ConsoleCommands(p2pool* pool)
-	: m_pool(pool)
-	, m_loop{}
-	, m_shutdownAsync{}
+	: TCPServer(DEFAULT_BACKLOG, ConsoleClient::allocate)
+	, m_pool(pool)
 	, m_tty{}
 	, m_stdin_pipe{}
 	, m_stdin_handle(nullptr)
-	, m_loopThread{}
 	, m_readBuf{}
 	, m_readBufInUse(false)
 {
@@ -48,18 +50,30 @@ ConsoleCommands::ConsoleCommands(p2pool* pool)
 		throw std::exception();
 	}
 
-	int err = uv_loop_init(&m_loop);
-	if (err) {
-		LOGERR(1, "failed to create event loop, error " << uv_err_name(err));
+	std::random_device rd;
+
+	for (int i = 0; i < 10; ++i) {
+		if (start_listening(false, "127.0.0.1", 49152 + (rd() % 16384))) {
+			break;
+		}
+	}
+
+	if (m_listenPort < 0) {
+		LOGERR(1, "failed to listen on TCP port");
 		throw std::exception();
 	}
 
-	err = uv_async_init(&m_loop, &m_shutdownAsync, on_shutdown);
-	if (err) {
-		LOGERR(1, "uv_async_init failed, error " << uv_err_name(err));
-		throw std::exception();
+	if (m_pool->api() && m_pool->params().m_localStats) {
+		m_pool->api()->set(p2pool_api::Category::LOCAL, "console",
+			[stdin_type, this](log::Stream& s)
+			{
+				s << "{\"mode\":" << ((stdin_type == UV_TTY) ? "\"tty\"" : "\"pipe\"")
+					<< ",\"tcp_port\":" << m_listenPort
+					<< "}";
+			});
 	}
-	m_shutdownAsync.data = this;
+
+	int err;
 
 	if (stdin_type == UV_TTY) {
 		LOGINFO(3, "processing stdin as UV_TTY");
@@ -101,9 +115,12 @@ ConsoleCommands::ConsoleCommands(p2pool* pool)
 
 ConsoleCommands::~ConsoleCommands()
 {
-	uv_async_send(&m_shutdownAsync);
-	uv_thread_join(&m_loopThread);
-	LOGINFO(1, "stopped");
+	shutdown_tcp();
+}
+
+void ConsoleCommands::on_shutdown()
+{
+	uv_close(reinterpret_cast<uv_handle_t*>(m_stdin_handle), nullptr);
 }
 
 typedef struct strconst {
@@ -123,7 +140,7 @@ typedef struct cmd {
 	cmdfunc *func;
 } cmd;
 
-static cmdfunc do_help, do_status, do_loglevel, do_addpeers, do_droppeers, do_showpeers, do_showworkers, do_showbans, do_outpeers, do_inpeers, do_exit;
+static cmdfunc do_help, do_status, do_loglevel, do_addpeers, do_droppeers, do_showpeers, do_showworkers, do_showbans, do_showhosts, do_nexthost, do_outpeers, do_inpeers, do_exit, do_version;
 
 #ifdef WITH_RANDOMX
 static cmdfunc do_start_mining, do_stop_mining;
@@ -138,6 +155,8 @@ static cmd cmds[] = {
 	{ STRCONST("peers"), "", "show all peers", do_showpeers },
 	{ STRCONST("workers"), "", "show all connected workers", do_showworkers },
 	{ STRCONST("bans"), "", "show all banned IPs", do_showbans },
+	{ STRCONST("hosts"), "", "show Monero hosts", do_showhosts },
+	{ STRCONST("next_host"), "", "switch to the next Monero host", do_nexthost },
 	{ STRCONST("outpeers"), "<N>", "set maximum number of outgoing connections", do_outpeers },
 	{ STRCONST("inpeers"), "<N>", "set maximum number of incoming connections", do_inpeers },
 #ifdef WITH_RANDOMX
@@ -145,6 +164,7 @@ static cmd cmds[] = {
 	{ STRCONST("stop_mining"), "", "stop mining", do_stop_mining },
 #endif
 	{ STRCONST("exit"), "", "terminate p2pool", do_exit },
+	{ STRCONST("version"), "", "show p2pool version", do_version },
 	{ STRCNULL, NULL, NULL, NULL }
 };
 
@@ -179,6 +199,7 @@ static void do_loglevel(p2pool * /* m_pool */, const char *args)
 	LOGINFO(0, "log level set to " << level);
 }
 
+// cppcheck-suppress constParameterCallback
 static void do_addpeers(p2pool *m_pool, const char *args)
 {
 	if (m_pool->p2p_server()) {
@@ -186,6 +207,7 @@ static void do_addpeers(p2pool *m_pool, const char *args)
 	}
 }
 
+// cppcheck-suppress constParameterCallback
 static void do_droppeers(p2pool *m_pool, const char * /* args */)
 {
 	if (m_pool->p2p_server()) {
@@ -193,6 +215,7 @@ static void do_droppeers(p2pool *m_pool, const char * /* args */)
 	}
 }
 
+// cppcheck-suppress constParameterCallback
 static void do_showpeers(p2pool* m_pool, const char* /* args */)
 {
 	if (m_pool->p2p_server()) {
@@ -200,6 +223,7 @@ static void do_showpeers(p2pool* m_pool, const char* /* args */)
 	}
 }
 
+// cppcheck-suppress constParameterCallback
 static void do_showworkers(p2pool* m_pool, const char* /* args */)
 {
 	if (m_pool->stratum_server()) {
@@ -207,6 +231,7 @@ static void do_showworkers(p2pool* m_pool, const char* /* args */)
 	}
 }
 
+// cppcheck-suppress constParameterCallback
 static void do_showbans(p2pool* m_pool, const char* /* args */)
 {
 	if (m_pool->stratum_server()) {
@@ -217,6 +242,19 @@ static void do_showbans(p2pool* m_pool, const char* /* args */)
 	}
 }
 
+// cppcheck-suppress constParameterCallback
+static void do_showhosts(p2pool* m_pool, const char* /* args */)
+{
+	m_pool->print_hosts();
+}
+
+// cppcheck-suppress constParameterCallback
+static void do_nexthost(p2pool* m_pool, const char* /* args */)
+{
+	m_pool->reconnect_to_host();
+}
+
+// cppcheck-suppress constParameterCallback
 static void do_outpeers(p2pool* m_pool, const char* args)
 {
 	if (m_pool->p2p_server()) {
@@ -225,6 +263,7 @@ static void do_outpeers(p2pool* m_pool, const char* args)
 	}
 }
 
+// cppcheck-suppress constParameterCallback
 static void do_inpeers(p2pool* m_pool, const char* args)
 {
 	if (m_pool->p2p_server()) {
@@ -253,6 +292,11 @@ static void do_exit(p2pool *m_pool, const char * /* args */)
 	m_pool->stop();
 }
 
+static void do_version(p2pool* /* m_pool */, const char* /* args */)
+{
+	LOGINFO(0, log::LightCyan() << VERSION);
+}
+
 void ConsoleCommands::allocCallback(uv_handle_t* handle, size_t /*suggested_size*/, uv_buf_t* buf)
 {
 	ConsoleCommands* pThis = static_cast<ConsoleCommands*>(handle->data);
@@ -273,46 +317,7 @@ void ConsoleCommands::stdinReadCallback(uv_stream_t* stream, ssize_t nread, cons
 	ConsoleCommands* pThis = static_cast<ConsoleCommands*>(stream->data);
 
 	if (nread > 0) {
-		std::string& command = pThis->m_command;
-		command.append(buf->base, nread);
-
-		do {
-			size_t k = command.find_first_of("\r\n");
-			if (k == std::string::npos) {
-				break;
-			}
-			command[k] = '\0';
-
-			cmd* c = cmds;
-			for (; c->name.len; ++c) {
-				if (!strncmp(command.c_str(), c->name.str, c->name.len)) {
-					const char* args = (c->name.len + 1 <= k) ? (command.c_str() + c->name.len + 1) : "";
-
-					// Skip spaces
-					while ((args[0] == ' ') || (args[0] == '\t')) {
-						++args;
-					}
-
-					// Check if an argument is required
-					if (strlen(c->arg) && !strlen(args)) {
-						LOGWARN(0, c->name.str << " requires arguments");
-						do_help(nullptr, nullptr);
-						break;
-					}
-
-					c->func(pThis->m_pool, args);
-					break;
-				}
-			}
-
-			if (!c->name.len) {
-				LOGWARN(0, "Unknown command " << command.c_str());
-				do_help(nullptr, nullptr);
-			}
-
-			k = command.find_first_not_of("\r\n", k + 1);
-			command.erase(0, k);
-		} while (true);
+		pThis->process_input(pThis->m_command, buf->base, static_cast<uint32_t>(nread));
 	}
 	else if (nread < 0) {
 		LOGWARN(4, "read error " << uv_err_name(static_cast<int>(nread)));
@@ -321,23 +326,48 @@ void ConsoleCommands::stdinReadCallback(uv_stream_t* stream, ssize_t nread, cons
 	pThis->m_readBufInUse = false;
 }
 
-void ConsoleCommands::loop(void* data)
+
+void ConsoleCommands::process_input(std::string& command, char* data, uint32_t size)
 {
-	LOGINFO(1, "event loop started");
+	command.append(data, size);
 
-	ConsoleCommands* pThis = static_cast<ConsoleCommands*>(data);
+	do {
+		size_t k = command.find_first_of("\r\n");
+		if (k == std::string::npos) {
+			break;
+		}
+		command[k] = '\0';
 
-	int err = uv_run(&pThis->m_loop, UV_RUN_DEFAULT);
-	if (err) {
-		LOGWARN(1, "uv_run returned " << err);
-	}
+		cmd* c = cmds;
+		for (; c->name.len; ++c) {
+			if (!strncmp(command.c_str(), c->name.str, c->name.len)) {
+				const char* args = (c->name.len + 1 <= k) ? (command.c_str() + c->name.len + 1) : "";
 
-	err = uv_loop_close(&pThis->m_loop);
-	if (err) {
-		LOGWARN(1, "uv_loop_close returned error " << uv_err_name(err));
-	}
+				// Skip spaces
+				while ((args[0] == ' ') || (args[0] == '\t')) {
+					++args;
+				}
 
-	LOGINFO(1, "event loop stopped");
+				// Check if an argument is required
+				if (strlen(c->arg) && !strlen(args)) {
+					LOGWARN(0, c->name.str << " requires arguments");
+					do_help(nullptr, nullptr);
+					break;
+				}
+
+				c->func(m_pool, args);
+				break;
+			}
+		}
+
+		if (!c->name.len) {
+			LOGWARN(0, "Unknown command " << command.c_str());
+			do_help(nullptr, nullptr);
+		}
+
+		k = command.find_first_not_of("\r\n", k + 1);
+		command.erase(0, k);
+	} while (true);
 }
 
 } // namespace p2pool

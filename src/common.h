@@ -152,8 +152,8 @@ struct alignas(uint64_t) hash
 
 	FORCEINLINE bool operator<(const hash& other) const
 	{
-		const uint64_t* a = reinterpret_cast<const uint64_t*>(h);
-		const uint64_t* b = reinterpret_cast<const uint64_t*>(other.h);
+		const uint64_t* a = u64();
+		const uint64_t* b = other.u64();
 
 		if (a[3] < b[3]) return true;
 		if (a[3] > b[3]) return false;
@@ -169,17 +169,20 @@ struct alignas(uint64_t) hash
 
 	FORCEINLINE bool operator==(const hash& other) const
 	{
-		const uint64_t* a = reinterpret_cast<const uint64_t*>(h);
-		const uint64_t* b = reinterpret_cast<const uint64_t*>(other.h);
+		const uint64_t* a = u64();
+		const uint64_t* b = other.u64();
 		return (a[0] == b[0]) && (a[1] == b[1]) && (a[2] == b[2]) && (a[3] == b[3]);
 	}
 
 	FORCEINLINE bool operator!=(const hash& other) const { return !operator==(other); }
 
 	FORCEINLINE bool empty() const {
-		const uint64_t* a = reinterpret_cast<const uint64_t*>(h);
+		const uint64_t* a = u64();
 		return (a[0] == 0) && (a[1] == 0) && (a[2] == 0) && (a[3] == 0);
 	}
+
+	FORCEINLINE uint64_t* u64() { return reinterpret_cast<uint64_t*>(h); }
+	FORCEINLINE const uint64_t* u64() const { return reinterpret_cast<const uint64_t*>(h); }
 
 	friend std::ostream& operator<<(std::ostream& s, const hash& d);
 	friend std::istream& operator>>(std::istream& s, hash& d);
@@ -204,7 +207,7 @@ struct
 	{
 #ifdef _MSC_VER
 		_addcarry_u64(_addcarry_u64(0, lo, b.lo, &lo), hi, b.hi, &hi);
-#elif __GNUC__
+#elif defined(__GNUC__) && !defined(DEV_CLANG_TIDY)
 		*reinterpret_cast<unsigned __int128*>(this) += *reinterpret_cast<const unsigned __int128*>(&b);
 #else
 		const uint64_t t = lo;
@@ -221,7 +224,7 @@ struct
 	{
 #ifdef _MSC_VER
 		_subborrow_u64(_subborrow_u64(0, lo, b.lo, &lo), hi, b.hi, &hi);
-#elif __GNUC__
+#elif defined(__GNUC__) && !defined(DEV_CLANG_TIDY)
 		*reinterpret_cast<unsigned __int128*>(this) -= *reinterpret_cast<const unsigned __int128*>(&b);
 #else
 		const uint64_t t = b.lo;
@@ -436,19 +439,13 @@ struct raw_ip
 
 	FORCEINLINE bool operator!=(const raw_ip& other) const { return !operator==(other); }
 
-	FORCEINLINE bool is_localhost() const
-	{
-		static constexpr raw_ip localhost_ipv4 = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x01 };
-		static constexpr raw_ip localhost_ipv6 = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
+	FORCEINLINE bool is_localhost() const { return (*this == localhost_ipv4) || (*this == localhost_ipv6); }
+	FORCEINLINE bool is_ipv4_prefix() const { return memcmp(data, ipv4_prefix, sizeof(ipv4_prefix)) == 0; }
 
-		return (*this == localhost_ipv4) || (*this == localhost_ipv6);
-	}
+	static const raw_ip localhost_ipv4;
+	static const raw_ip localhost_ipv6;
 
-	FORCEINLINE bool is_ipv4_prefix() const
-	{
-		alignas(8) static constexpr uint8_t ipv4_prefix[12] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff };
-		return memcmp(data, ipv4_prefix, sizeof(ipv4_prefix)) == 0;
-	}
+	alignas(8) static const uint8_t ipv4_prefix[12];
 };
 
 static_assert(sizeof(raw_ip) == 16, "struct raw_ip has invalid size");

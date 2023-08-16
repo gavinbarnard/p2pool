@@ -34,4 +34,19 @@
 
 ### Example command line
 
+```
 p2pool.exe --host 127.0.0.1 --rpc-port 18081 --zmq-port 18083 --wallet YOUR_WALLET_ADDRESS --stratum 0.0.0.0:3333 --p2p 0.0.0.0:37889
+```
+
+### Multiple backup hosts
+
+You can have multiple hosts in command line. If P2Pool detects that the host it's currently using is down or stuck, it will cycle through hosts until it finds a working one. It will not switch back as long as the current host it found is working.
+
+Each new host uses RPC and zmq-pub port numbers from the previous host (or default 18081/18083 if none were specified). Note that `--rpc-login` is not copied from the previous host, you must specify it for each host that has username/password.
+
+In this example, you have local Monero host running on ports 18081/18083 (RPC/zmq-pub), and several backup hosts running on ports 18089/18084.
+
+
+```
+p2pool.exe --host 127.0.0.1 --host xmr1.rs.me --rpc-port 18089 --zmq-port 18084 --host xmr2.rs.me --host xmr3.rs.me --wallet YOUR_WALLET_ADDRESS
+```

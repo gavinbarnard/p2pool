@@ -46,16 +46,18 @@ public:
 
 	void fill_sidechain_data(PoolBlock& block, std::vector<MinerShare>& shares) const;
 
-	bool block_seen(const PoolBlock& block);
-	void unsee_block(const PoolBlock& block);
+	bool incoming_block_seen(const PoolBlock& block);
+	void forget_incoming_block(const PoolBlock& block);
+	void cleanup_incoming_blocks();
+
 	bool add_external_block(PoolBlock& block, std::vector<hash>& missing_blocks);
 	bool add_block(const PoolBlock& block);
-	void get_missing_blocks(std::vector<hash>& missing_blocks) const;
+	void get_missing_blocks(unordered_set<hash>& missing_blocks) const;
 
 	PoolBlock* find_block(const hash& id) const;
 	void watch_mainchain_block(const ChainMain& data, const hash& possible_id);
 
-	bool get_block_blob(const hash& id, std::vector<uint8_t>& blob) const;
+	const PoolBlock* get_block_blob(const hash& id, std::vector<uint8_t>& blob) const;
 	bool get_outputs_blob(PoolBlock* block, uint64_t total_reward, std::vector<uint8_t>& blob, uv_loop_t* loop) const;
 
 	void print_status(bool obtain_sidechain_lock = true) const;
@@ -84,6 +86,7 @@ public:
 
 #ifdef P2POOL_UNIT_TESTS
 	difficulty_type m_testMainChainDiff;
+	const unordered_map<hash, PoolBlock*>& blocksById() const { return m_blocksById; }
 #endif
 
 	static bool split_reward(uint64_t reward, const std::vector<MinerShare>& shares, std::vector<uint64_t>& rewards);
@@ -118,8 +121,9 @@ private:
 	unordered_map<hash, uint64_t> m_seenWallets;
 	uint64_t m_seenWalletsLastPruneTime;
 
-	uv_mutex_t m_seenBlocksLock;
-	unordered_set<PoolBlock::full_id> m_seenBlocks;
+	// Used to quickly cut off multiple broadcasts of the same block by different peers. Only the first broadcast will be processed.
+	uv_mutex_t m_incomingBlocksLock;
+	unordered_map<PoolBlock::full_id, uint64_t> m_incomingBlocks;
 
 	std::vector<DifficultyData> m_difficultyData;
 
@@ -153,6 +157,10 @@ private:
 	unordered_set<size_t>* m_uniquePrecalcInputs;
 
 	std::atomic<bool> m_precalcFinished;
+
+#ifdef DEV_TEST_SYNC
+	uint64_t m_firstPruneTime;
+#endif
 
 	hash m_consensusHash;
 

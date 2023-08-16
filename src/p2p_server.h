@@ -18,7 +18,8 @@
 #pragma once
 
 #include "tcp_server.h"
-#include <list>
+#include "pool_block.h"
+#include <deque>
 
 namespace p2pool {
 
@@ -26,29 +27,35 @@ class p2pool;
 struct PoolBlock;
 class BlockCache;
 
-static constexpr size_t P2P_BUF_SIZE = 128 * 1024;
+// Max block size plus BLOCK_RESPONSE header (5 bytes)
+static constexpr uint64_t P2P_BUF_SIZE = MAX_BLOCK_SIZE + (1 + sizeof(uint32_t));
+static_assert((P2P_BUF_SIZE & (P2P_BUF_SIZE - 1)) == 0, "P2P_BUF_SIZE is not a power of 2, fix MAX_BLOCK_SIZE");
+
 static constexpr size_t PEER_LIST_RESPONSE_MAX_PEERS = 16;
 static constexpr int DEFAULT_P2P_PORT = 37889;
 static constexpr int DEFAULT_P2P_PORT_MINI = 37888;
 
 static constexpr uint32_t PROTOCOL_VERSION_1_0 = 0x00010000UL;
 static constexpr uint32_t PROTOCOL_VERSION_1_1 = 0x00010001UL;
+static constexpr uint32_t PROTOCOL_VERSION_1_2 = 0x00010002UL;
 
-static constexpr uint32_t SUPPORTED_PROTOCOL_VERSION = PROTOCOL_VERSION_1_1;
+static constexpr uint32_t SUPPORTED_PROTOCOL_VERSION = PROTOCOL_VERSION_1_2;
 
-class P2PServer : public TCPServer<P2P_BUF_SIZE, P2P_BUF_SIZE>
+class P2PServer : public TCPServer
 {
 public:
 	enum class MessageId {
-		HANDSHAKE_CHALLENGE = 0,
-		HANDSHAKE_SOLUTION = 1,
-		LISTEN_PORT = 2,
-		BLOCK_REQUEST = 3,
-		BLOCK_RESPONSE = 4,
-		BLOCK_BROADCAST = 5,
-		PEER_LIST_REQUEST = 6,
-		PEER_LIST_RESPONSE = 7,
-		BLOCK_BROADCAST_COMPACT = 8,
+		HANDSHAKE_CHALLENGE,
+		HANDSHAKE_SOLUTION,
+		LISTEN_PORT,
+		BLOCK_REQUEST,
+		BLOCK_RESPONSE,
+		BLOCK_BROADCAST,
+		PEER_LIST_REQUEST,
+		PEER_LIST_RESPONSE,
+		BLOCK_BROADCAST_COMPACT,
+		BLOCK_NOTIFY,
+		LAST = BLOCK_NOTIFY,
 	};
 
 	explicit P2PServer(p2pool *pool);
@@ -101,18 +108,21 @@ public:
 		void on_after_handshake(uint8_t* &p);
 		bool on_listen_port(const uint8_t* buf);
 		bool on_block_request(const uint8_t* buf);
-		bool on_block_response(const uint8_t* buf, uint32_t size, const hash& expected_id);
+		bool on_block_response(const uint8_t* buf, uint32_t size, uint64_t expected_id);
 		bool on_block_broadcast(const uint8_t* buf, uint32_t size, bool compact);
 		bool on_peer_list_request(const uint8_t* buf);
 		void on_peer_list_response(const uint8_t* buf);
+		void on_block_notify(const uint8_t* buf);
 
 		bool handle_incoming_block_async(const PoolBlock* block, uint64_t max_time_delta = 0);
-		void handle_incoming_block(p2pool* pool, PoolBlock& block, const uint32_t reset_counter, const raw_ip& addr, std::vector<hash>& missing_blocks);
-		void post_handle_incoming_block(const uint32_t reset_counter, std::vector<hash>& missing_blocks);
+		void handle_incoming_block(p2pool* pool, PoolBlock& block, const uint32_t reset_counter, bool is_v6, const raw_ip& addr, std::vector<hash>& missing_blocks);
+		void post_handle_incoming_block(const PoolBlock& block, const uint32_t reset_counter, std::vector<hash>& missing_blocks);
 
 		bool is_good() const { return m_handshakeComplete && !m_handshakeInvalid && (m_listenPort >= 0); }
 
 		const char* software_name() const;
+
+		alignas(8) char m_p2pReadBuf[P2P_BUF_SIZE];
 
 		uint64_t m_peerId;
 		uint64_t m_connectedTime;
@@ -125,8 +135,7 @@ public:
 		bool m_handshakeInvalid;
 		int m_listenPort;
 
-		uint32_t m_fastPeerListRequestCount;
-		uint64_t m_prevIncomingPeerListRequest;
+		uint64_t m_prevPeersSent;
 		uint64_t m_nextOutgoingPeerListRequest;
 		std::chrono::high_resolution_clock::time_point m_lastPeerListRequestTime;
 		int m_peerListPendingRequests;
@@ -137,14 +146,14 @@ public:
 
 		int64_t m_pingTime;
 
-		std::list<hash> m_blockPendingRequests;
+		std::deque<uint64_t> m_blockPendingRequests;
 
 		uint64_t m_lastAlive;
 		uint64_t m_lastBroadcastTimestamp;
 		uint64_t m_lastBlockrequestTimestamp;
 
 		hash m_broadcastedHashes[8];
-		std::atomic<uint32_t> m_broadcastedHashesIndex{ 0 };
+		uint32_t m_broadcastedHashesIndex;
 	};
 
 	void broadcast(const PoolBlock& block, const PoolBlock* parent);
@@ -166,7 +175,11 @@ public:
 	int deserialize_block(const uint8_t* buf, uint32_t size, bool compact, uint64_t received_timestamp);
 	const PoolBlock* get_block() const { return m_block; }
 
+	const PoolBlock* find_block(const hash& id) const;
+
 private:
+	const char* get_category() const override { return "P2PServer "; }
+
 	p2pool* m_pool;
 	BlockCache* m_cache;
 	bool m_cacheLoaded;
@@ -183,7 +196,7 @@ private:
 
 	void flush_cache();
 	void download_missing_blocks();
-	void check_zmq();
+	void check_host();
 	void check_block_template();
 	void update_peer_connections();
 	void update_peer_list();
@@ -193,7 +206,7 @@ private:
 	void load_peer_list();
 	void load_monerod_peer_list();
 	void update_peer_in_list(bool is_v6, const raw_ip& ip, int port);
-	void remove_peer_from_list(P2PClient* client);
+	void remove_peer_from_list(const P2PClient* client);
 	void remove_peer_from_list(const raw_ip& ip);
 
 	std::mt19937_64 m_rng;
@@ -241,6 +254,7 @@ private:
 
 	bool m_lookForMissingBlocks;
 	unordered_set<std::pair<uint64_t, uint64_t>> m_missingBlockRequests;
+	unordered_set<uint64_t> m_blockNotifyRequests;
 
 	P2PClient* m_fastestPeer;
 

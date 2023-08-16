@@ -7,8 +7,26 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 if (CMAKE_CXX_COMPILER_ID MATCHES GNU)
 	set(GENERAL_FLAGS "-pthread")
+
+	if (DEV_WITH_TSAN)
+		set(GENERAL_FLAGS "${GENERAL_FLAGS} -fno-omit-frame-pointer -fsanitize=thread")
+	endif()
+
+	if (DEV_WITH_UBSAN)
+		set(GENERAL_FLAGS "${GENERAL_FLAGS} -fno-omit-frame-pointer -fsanitize=undefined")
+	endif()
+
+	if (DEV_WITH_ASAN)
+		set(GENERAL_FLAGS "${GENERAL_FLAGS} -fno-omit-frame-pointer -fsanitize=address")
+	endif()
+
 	set(WARNING_FLAGS "-Wall -Wextra -Wcast-align -Wcast-qual -Wlogical-op -Wstrict-overflow=2 -Wundef -Wformat=2 -Wpointer-arith -Werror")
-	set(OPTIMIZATION_FLAGS "-Ofast -s")
+
+	if (DEV_WITH_TSAN OR DEV_WITH_UBSAN OR DEV_WITH_ASAN)
+		set(OPTIMIZATION_FLAGS "-O2 -g")
+	else()
+		set(OPTIMIZATION_FLAGS "-Ofast -s")
+	endif()
 
 	if (WITH_LTO)
 		set(OPTIMIZATION_FLAGS "${OPTIMIZATION_FLAGS} -flto -fuse-linker-plugin")
@@ -50,9 +68,17 @@ elseif (CMAKE_CXX_COMPILER_ID MATCHES MSVC)
 
 	set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /LTCG")
 elseif (CMAKE_CXX_COMPILER_ID MATCHES Clang)
-	set(GENERAL_FLAGS "-pthread")
+	if (WIN32)
+		set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
+	else()
+		set(GENERAL_FLAGS "-pthread")
+	endif()
+
 	set(WARNING_FLAGS "-Wall -Wextra -Wno-undefined-internal -Wunreachable-code-aggressive -Wmissing-prototypes -Wmissing-variable-declarations -Werror")
-	set(OPTIMIZATION_FLAGS "-Ofast -funroll-loops -fmerge-all-constants")
+
+	if (NOT DEV_WITH_MSAN)
+		set(OPTIMIZATION_FLAGS "-Ofast -funroll-loops -fmerge-all-constants")
+	endif()
 
 	if (WITH_LTO)
 		set(OPTIMIZATION_FLAGS "${OPTIMIZATION_FLAGS} -flto")

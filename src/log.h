@@ -65,7 +65,7 @@ struct Stream
 		return *this;
 	}
 
-	template<typename T, int base = 10>
+	template<typename T, unsigned int base = 10>
 	NOINLINE void writeInt(T data)
 	{
 		static_assert(1 < base && base <= 64, "Invalid base");
@@ -78,11 +78,13 @@ struct Stream
 		size_t k = sizeof(buf);
 		int w = m_numberWidth;
 
+		std::make_unsigned_t<T> udata = static_cast<std::make_unsigned_t<T>>(data);
+
 		do {
-			buf[--k] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"[data % base];
-			data /= base;
+			buf[--k] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"[udata % base];
+			udata /= base;
 			--w;
-		} while ((data > 0) || (w > 0));
+		} while (udata || (w > 0));
 
 		if (negative) {
 			buf[--k] = '-';
@@ -104,8 +106,6 @@ struct Stream
 
 	FORCEINLINE int getNumberWidth() const { return m_numberWidth; }
 	FORCEINLINE void setNumberWidth(int width) { m_numberWidth = width; }
-
-	NOINLINE void writeCurrentTime();
 
 	int m_pos;
 	int m_numberWidth;
@@ -146,7 +146,13 @@ COLOR_ENTRY(LightCyan,    "\x1b[0;96m")
 
 template<size_t N> struct Stream::Entry<char[N]>
 {
-	static FORCEINLINE void put(const char (&data)[N], Stream* wrapper) { wrapper->writeBuf(data, N - 1); }
+	template<typename T>
+	// cppcheck-suppress constParameterReference
+	static FORCEINLINE void put(T (&data)[N], Stream* wrapper)
+	{
+		static_assert(std::is_same<T, const char>::value, "Non-const char buffer must be cast to \"const char*\"");
+		wrapper->writeBuf(data, N - 1);
+	}
 };
 
 template<> struct Stream::Entry<const char*>
@@ -156,6 +162,7 @@ template<> struct Stream::Entry<const char*>
 
 template<> struct Stream::Entry<char*>
 {
+	// cppcheck-suppress constParameterPointer
 	static FORCEINLINE void put(char* data, Stream* wrapper) { wrapper->writeBuf(data, strlen(data)); }
 };
 
@@ -282,6 +289,9 @@ template<> struct log::Stream::Entry<const_buf>
 struct hex_buf
 {
 	FORCEINLINE hex_buf(const uint8_t* data, size_t size) : m_data(data), m_size(size) {}
+
+	template<typename T>
+	explicit FORCEINLINE hex_buf(const T* data) : m_data(reinterpret_cast<const uint8_t*>(data)), m_size(sizeof(T)) {}
 
 	const uint8_t* m_data;
 	size_t m_size;
@@ -486,16 +496,19 @@ struct DummyStream
 	}
 };
 
+#ifdef __COVERITY__
+// Coverity doesn't like this macro - CID 393138: Big parameter passed by value (PASS_BY_VALUE)
+#define SIDE_EFFECT_CHECK(level, ...)
+#else
 #define SIDE_EFFECT_CHECK(level, ...) \
-	do { \
-		if (0) { \
-			MSVC_PRAGMA(warning(suppress:26444)) \
-			[=]() { \
-				log::DummyStream x; \
-				x << (level) << __VA_ARGS__; \
-			}; \
-		} \
-	} while (0)
+	if (0) { \
+		MSVC_PRAGMA(warning(suppress:26444)) \
+		[=]() { \
+			log::DummyStream x; \
+			x << (level) << __VA_ARGS__; \
+		}; \
+	}
+#endif
 
 #ifdef P2POOL_LOG_DISABLE
 

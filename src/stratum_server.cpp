@@ -37,12 +37,10 @@ static constexpr int32_t BAD_SHARE_POINTS = -5;
 static constexpr int32_t GOOD_SHARE_POINTS = 1;
 static constexpr int32_t BAN_THRESHOLD_POINTS = -15;
 
-#include "tcp_server.inl"
-
 namespace p2pool {
 
 StratumServer::StratumServer(p2pool* pool)
-	: TCPServer(StratumClient::allocate)
+	: TCPServer(DEFAULT_BACKLOG, StratumClient::allocate)
 	, m_pool(pool)
 	, m_autoDiff(pool->params().m_autoDiff)
 	, m_rng(RandomDeviceSeed::instance)
@@ -57,6 +55,8 @@ StratumServer::StratumServer(p2pool* pool)
 	, m_totalFailedShares(0)
 	, m_apiLastUpdateTime(0)
 {
+	m_callbackBuf.resize(STRATUM_BUF_SIZE);
+
 	// Diffuse the initial state in case it has low quality
 	m_rng.discard(10000);
 
@@ -107,6 +107,7 @@ void StratumServer::on_block(const BlockTemplate& block)
 	const uint32_t num_connections = m_numConnections;
 	if (num_connections == 0) {
 		LOGINFO(4, "no clients connected");
+		api_update_local_stats(seconds_since_epoch());
 		return;
 	}
 
@@ -186,6 +187,8 @@ void StratumServer::on_block(const BlockTemplate& block)
 			delete blobs_data;
 		}
 	}
+
+	api_update_local_stats(seconds_since_epoch());
 }
 
 template<size_t N>
@@ -284,13 +287,13 @@ bool StratumServer::on_login(StratumClient* client, uint32_t id, const char* log
 	client->m_lastJobTarget = target;
 
 	const bool result = send(client,
-		[client, id, &hashing_blob, job_id, blob_size, target, height, &seed_hash](void* buf, size_t buf_size)
+		[client, id, &hashing_blob, job_id, blob_size, target, height, &seed_hash](uint8_t* buf, size_t buf_size)
 		{
 			do {
 				client->m_rpcId = static_cast<StratumServer*>(client->m_owner)->get_random32();
 			} while (!client->m_rpcId);
 
-			log::hex_buf target_hex(reinterpret_cast<const uint8_t*>(&target), sizeof(uint64_t));
+			log::hex_buf target_hex(&target);
 
 			if (target >= TARGET_4_BYTES_LIMIT) {
 				target_hex.m_data += sizeof(uint32_t);
@@ -374,7 +377,7 @@ bool StratumServer::on_submit(StratumClient* client, uint32_t id, const char* jo
 		if (!block.get_difficulties(template_id, height, sidechain_height, mainchain_diff, sidechain_diff)) {
 			LOGWARN(4, "client " << static_cast<char*>(client->m_addrString) << " got a stale share");
 			return send(client,
-				[id](void* buf, size_t buf_size)
+				[id](uint8_t* buf, size_t buf_size)
 				{
 					log::Stream s(buf, buf_size);
 					s << "{\"id\":" << id << ",\"jsonrpc\":\"2.0\",\"error\":{\"message\":\"Stale share\"}}\n";
@@ -407,6 +410,7 @@ bool StratumServer::on_submit(StratumClient* client, uint32_t id, const char* jo
 		share->m_req.data = share;
 		share->m_server = this;
 		share->m_client = client;
+		share->m_clientIPv6 = client->m_isV6;
 		share->m_clientAddr = client->m_addr;
 		share->m_clientResetCounter = client->m_resetCounter.load();
 		share->m_rpcId = client->m_rpcId;
@@ -459,7 +463,7 @@ bool StratumServer::on_submit(StratumClient* client, uint32_t id, const char* jo
 	LOGWARN(4, "client " << static_cast<char*>(client->m_addrString) << " got a share with invalid job id " << job_id << " (latest job sent has id " << client->m_perConnectionJobId << ')');
 
 	const bool result = send(client,
-		[id](void* buf, size_t buf_size)
+		[id](uint8_t* buf, size_t buf_size)
 		{
 			log::Stream s(buf, buf_size);
 			s << "{\"id\":" << id << ",\"jsonrpc\":\"2.0\",\"error\":{\"message\":\"Invalid job id\"}}\n";
@@ -585,8 +589,8 @@ void StratumServer::print_stratum_status() const
 	const uint64_t hashrate_24h = (dt_24h > 0) ? (hashes_24h / dt_24h) : 0;
 
 	char shares_failed_buf[64] = {};
-	log::Stream s(shares_failed_buf);
 	if (shares_failed) {
+		log::Stream s(shares_failed_buf);
 		s << log::Yellow() << "\nShares failed      = " << shares_failed << log::NoColor();
 	}
 
@@ -769,9 +773,9 @@ void StratumServer::on_blobs_ready()
 		client->m_lastJobTarget = target;
 
 		const bool result = send(client,
-			[data, target, hashing_blob, job_id](void* buf, size_t buf_size)
+			[data, target, hashing_blob, job_id](uint8_t* buf, size_t buf_size)
 			{
-				log::hex_buf target_hex(reinterpret_cast<const uint8_t*>(&target), sizeof(uint64_t));
+				log::hex_buf target_hex(&target);
 
 				if (target >= TARGET_4_BYTES_LIMIT) {
 					target_hex.m_data += sizeof(uint32_t);
@@ -840,7 +844,7 @@ void StratumServer::on_share_found(uv_work_t* req)
 	SubmittedShare* share = reinterpret_cast<SubmittedShare*>(req->data);
 	StratumServer* server = share->m_server;
 
-	if (server->is_banned(share->m_clientAddr)) {
+	if (server->is_banned(share->m_clientIPv6, share->m_clientAddr)) {
 		share->m_highEnoughDifficulty = false;
 		share->m_result = SubmittedShare::Result::BANNED;
 		return;
@@ -927,7 +931,7 @@ void StratumServer::on_share_found(uv_work_t* req)
 	}
 
 	// Send the response to miner
-	const uint64_t value = *reinterpret_cast<uint64_t*>(share->m_resultHash.h + HASH_SIZE - sizeof(uint64_t));
+	const uint64_t value = share->m_resultHash.u64()[HASH_SIZE / sizeof(uint64_t) - 1];
 
 	if (LIKELY(value < target)) {
 		const uint64_t timestamp = share->m_timestamp;
@@ -970,19 +974,19 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 		BACKGROUND_JOB_STOP(StratumServer::on_share_found);
 	}
 
-	ON_SCOPE_LEAVE([share]()
+	StratumServer* server = share->m_server;
+
+	ON_SCOPE_LEAVE([share, server]()
 		{
 			ASAN_POISON_MEMORY_REGION(share, sizeof(SubmittedShare));
-			share->m_server->m_submittedSharesPool.push_back(share);
+			server->m_submittedSharesPool.push_back(share);
 		});
-
-	StratumServer* server = share->m_server;
 
 	const bool bad_share = (share->m_result == SubmittedShare::Result::LOW_DIFF) || (share->m_result == SubmittedShare::Result::INVALID_POW);
 
 	if ((client->m_resetCounter.load() == share->m_clientResetCounter) && (client->m_rpcId == share->m_rpcId)) {
 		const bool result = server->send(client,
-			[share](void* buf, size_t buf_size)
+			[share](uint8_t* buf, size_t buf_size)
 			{
 				log::Stream s(buf, buf_size);
 				switch (share->m_result) {
@@ -1017,7 +1021,7 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 		}
 	}
 	else if (bad_share) {
-		server->ban(share->m_clientAddr, DEFAULT_BAN_TIME);
+		server->ban(share->m_clientIPv6, share->m_clientAddr, DEFAULT_BAN_TIME);
 	}
 }
 
@@ -1028,7 +1032,8 @@ void StratumServer::on_shutdown()
 }
 
 StratumServer::StratumClient::StratumClient()
-	: m_rpcId(0)
+	: Client(m_stratumReadBuf, sizeof(m_stratumReadBuf))
+	, m_rpcId(0)
 	, m_perConnectionJobId(0)
 	, m_connectedTime(0)
 	, m_jobs{}
@@ -1041,6 +1046,7 @@ StratumServer::StratumClient::StratumClient()
 	, m_lastJobTarget(0)
 	, m_score(0)
 {
+	m_stratumReadBuf[0] = '\0';
 }
 
 void StratumServer::StratumClient::reset()
@@ -1073,7 +1079,7 @@ bool StratumServer::StratumClient::on_connect()
 
 bool StratumServer::StratumClient::on_read(char* data, uint32_t size)
 {
-	if ((data != m_readBuf + m_numRead) || (data + size > m_readBuf + sizeof(m_readBuf))) {
+	if ((data != m_readBuf + m_numRead) || (data + size > m_readBuf + m_readBufSize)) {
 		LOGERR(1, "client: invalid data pointer or size in on_read()");
 		ban(DEFAULT_BAN_TIME);
 		return false;
@@ -1260,9 +1266,9 @@ void StratumServer::api_update_local_stats(uint64_t timestamp)
 		return;
 	}
 
-	// Rate limit to no more than once in 60 seconds.
+	// Rate limit to no more than once in 20 seconds.
 	uint64_t t = m_apiLastUpdateTime.load();
-	if (timestamp < t + 60) {
+	if (timestamp < t + 20) {
 		return;
 	}
 
@@ -1320,6 +1326,8 @@ void StratumServer::api_update_local_stats(uint64_t timestamp)
 	uint32_t connections = m_numConnections;
 	uint32_t incoming_connections = m_numIncomingConnections;
 
+	const double block_reward_share_percent = m_pool->side_chain().get_reward_share(m_pool->params().m_wallet) * 100.0;
+
 	m_pool->api()->set(p2pool_api::Category::LOCAL, "stratum",
 		[hashrate_15m, hashrate_1h, hashrate_24h, total_hashes, reward, pshares, shares_found, shares_failed, average_effort, current_effort, connections, incoming_connections](log::Stream& s)
 		{
@@ -1335,6 +1343,7 @@ void StratumServer::api_update_local_stats(uint64_t timestamp)
 				<< ",\"current_effort\":" << current_effort
 				<< ",\"connections\":" << connections
 				<< ",\"incoming_connections\":" << incoming_connections
+				<< ",\"block_reward_share_percent\":" << block_reward_share_percent
 				<< "}";
 		});
 }

@@ -9,6 +9,9 @@ if (${CMAKE_VERSION} VERSION_GREATER "3.5.2")
 	set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT p2pool_tests)
 endif()
 
+set(BUILD_GMOCK OFF CACHE BOOL "Builds the googlemock subproject" FORCE)
+set(INSTALL_GTEST OFF CACHE BOOL "Enable installation of googletest. (Projects embedding googletest may want to turn this OFF.)" FORCE)
+
 add_subdirectory(googletest)
 set(LIBS gtest)
 
@@ -55,6 +58,7 @@ set(SOURCES
 	../src/pow_hash.cpp
 	../src/side_chain.cpp
 	../src/stratum_server.cpp
+	../src/tcp_server.cpp
 	../src/util.cpp
 	../src/wallet.cpp
 	../src/zmq_reader.cpp
@@ -91,8 +95,8 @@ include_directories(src)
 include_directories(googletest/googletest/include)
 
 if (WIN32)
-	set(LIBS ${LIBS} ws2_32 iphlpapi userenv psapi wldap32)
-	if (CMAKE_CXX_COMPILER_ID MATCHES GNU)
+	set(LIBS ${LIBS} ws2_32 iphlpapi userenv psapi dnsapi dbghelp)
+	if ((CMAKE_CXX_COMPILER_ID MATCHES GNU) OR (CMAKE_CXX_COMPILER_ID MATCHES Clang))
 		set(LIBS ${LIBS} bcrypt)
 	endif()
 	add_definitions(-DCURL_STATICLIB)
@@ -103,17 +107,17 @@ endif()
 if (STATIC_LIBS)
 	set(ZMQ_LIBRARY "${CMAKE_SOURCE_DIR}/../external/src/libzmq/build/lib/libzmq.a")
 	set(ZMQ_LIBRARY_DEBUG "${CMAKE_SOURCE_DIR}/../external/src/libzmq/build/lib/libzmq.a")
-	set(UV_LIBRARY_DEBUG "${CMAKE_SOURCE_DIR}/../external/src/libuv/build/libuv_a.a")
-	set(UV_LIBRARY "${CMAKE_SOURCE_DIR}/../external/src/libuv/build/libuv_a.a")
+	set(UV_LIBRARY_DEBUG "${CMAKE_SOURCE_DIR}/../external/src/libuv/build/libuv.a")
+	set(UV_LIBRARY "${CMAKE_SOURCE_DIR}/../external/src/libuv/build/libuv.a")
 	set(CURL_LIBRARY_DEBUG "${CMAKE_SOURCE_DIR}/../external/src/curl/lib/.libs/libcurl.a")
 	set(CURL_LIBRARY "${CMAKE_SOURCE_DIR}/../external/src/curl/lib/.libs/libcurl.a")
 else()
 	if (CMAKE_CXX_COMPILER_ID MATCHES MSVC)
 		find_library(ZMQ_LIBRARY_DEBUG NAMES libzmq-v142-mt-sgd-4_3_5 PATHS "../external/lib/libzmq/Debug")
 		find_library(ZMQ_LIBRARY NAMES libzmq-v142-mt-s-4_3_5 PATHS "../external/lib/libzmq/Release")
-		find_library(UV_LIBRARY_DEBUG NAMES uv_a PATHS "../external/lib/libuv/Debug")
-		find_library(UV_LIBRARY NAMES uv_a PATHS "../external/lib/libuv/Release")
-		find_library(CURL_LIBRARY_DEBUG NAMES libcurld PATHS "../external/lib/libcurl/Debug")
+		find_library(UV_LIBRARY_DEBUG NAMES libuv PATHS "../external/lib/libuv/Debug")
+		find_library(UV_LIBRARY NAMES libuv PATHS "../external/lib/libuv/Release")
+		find_library(CURL_LIBRARY_DEBUG NAMES libcurl-d PATHS "../external/lib/libcurl/Debug")
 		find_library(CURL_LIBRARY NAMES libcurl PATHS "../external/lib/libcurl/Release")
 		add_definitions(-D_DISABLE_VECTOR_ANNOTATION)
 		add_definitions(-D_DISABLE_STRING_ANNOTATION)
@@ -170,9 +174,11 @@ if (HAVE_BITSCANREVERSE64)
 	add_definitions(/DHAVE_BITSCANREVERSE64)
 endif()
 
+add_definitions("-DRAPIDJSON_PARSE_DEFAULT_FLAGS=kParseTrailingCommasFlag")
+
 add_executable(${CMAKE_PROJECT_NAME} ${HEADERS} ${SOURCES})
 target_link_libraries(${CMAKE_PROJECT_NAME} debug ${ZMQ_LIBRARY_DEBUG} debug ${UV_LIBRARY_DEBUG} debug ${CURL_LIBRARY_DEBUG} optimized ${ZMQ_LIBRARY} optimized ${UV_LIBRARY} optimized ${CURL_LIBRARY} ${LIBS})
 add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/src/crypto_tests.txt" $<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>)
 add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/src/block.dat" $<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>)
-add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/src/sidechain_dump.dat" $<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>)
-add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/src/sidechain_dump_mini.dat" $<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>)
+add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/src/sidechain_dump.dat.gz" $<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>)
+add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/src/sidechain_dump_mini.dat.gz" $<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>)
