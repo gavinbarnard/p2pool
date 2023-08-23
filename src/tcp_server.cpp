@@ -27,7 +27,6 @@ TCPServer::TCPServer(int default_backlog, allocate_client_callback allocate_new_
 	: m_allocateNewClient(allocate_new_client)
 	, m_defaultBacklog(default_backlog)
 	, m_loopThread{}
-	, m_loopThreadRunning(false)
 #ifdef WITH_UPNP
 	, m_portMapping(0)
 #endif
@@ -474,9 +473,7 @@ void TCPServer::shutdown_tcp()
 	}
 #endif
 
-	if (m_loopThreadRunning.load()) {
-		uv_thread_join(&m_loopThread);
-	}
+	uv_thread_join(&m_loopThread);
 
 	uv_mutex_destroy(&m_bansLock);
 
@@ -573,13 +570,16 @@ bool TCPServer::send_internal(Client* client, Callback<size_t, uint8_t*, size_t>
 	return true;
 }
 
+const char* TCPServer::get_log_category() const
+{
+	return log_category_prefix;
+}
+
 void TCPServer::loop(void* data)
 {
 	TCPServer* server = static_cast<TCPServer*>(data);
-	server->m_loopThreadRunning.exchange(true);
-	ON_SCOPE_LEAVE([server]() { server->m_loopThreadRunning.exchange(false); });
 
-	log_category_prefix = server->get_category();
+	log_category_prefix = server->get_log_category();
 
 	LOGINFO(1, "event loop started");
 	server_event_loop_thread = data;

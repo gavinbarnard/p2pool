@@ -143,13 +143,12 @@ private:
 	std::vector<uv_tcp_t*> m_listenSockets;
 
 protected:
-	virtual const char* get_category() const { return "TCPServer "; }
+	virtual const char* get_log_category() const;
 
 	std::vector<uint8_t> m_callbackBuf;
 	int m_defaultBacklog;
 
 	uv_thread_t m_loopThread;
-	std::atomic<bool> m_loopThreadRunning;
 
 	static void loop(void* data);
 
