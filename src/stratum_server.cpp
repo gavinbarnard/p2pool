@@ -23,7 +23,7 @@
 #include "params.h"
 #include "p2pool_api.h"
 
-static constexpr char log_category_prefix[] = "StratumServer ";
+LOG_CATEGORY(StratumServer)
 
 static constexpr int DEFAULT_BACKLOG = 128;
 static constexpr uint64_t DEFAULT_BAN_TIME = 600;
@@ -544,6 +544,11 @@ void StratumServer::reset_share_counters()
 	m_totalFailedShares = 0;
 }
 
+const char* StratumServer::get_log_category() const
+{
+	return log_category_prefix;
+}
+
 void StratumServer::print_stratum_status() const
 {
 	uint64_t hashes_15m, hashes_1h, hashes_24h, total_hashes;
@@ -969,7 +974,7 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 
 			const size_t k = static_cast<size_t>(share->m_result);
 			const char* reason = (k < array_size(reason_list)) ? reason_list[k] : "unknown";
-			LOGWARN(0, log::Green() << "INVALID SHARE: mainchain height " << share->m_mainchainHeight << ", sidechain height " << share->m_sidechainHeight << ", diff " << share->m_sidechainDifficulty << ", client " << static_cast<char*>(client->m_addrString) << (*s ? ", user " : "") << s << ", reason: " << reason);
+			LOGWARN(0, "INVALID SHARE: mainchain height " << share->m_mainchainHeight << ", sidechain height " << share->m_sidechainHeight << ", diff " << share->m_sidechainDifficulty << ", client " << static_cast<char*>(client->m_addrString) << (*s ? ", user " : "") << s << ", reason: " << reason);
 		}
 		BACKGROUND_JOB_STOP(StratumServer::on_share_found);
 	}

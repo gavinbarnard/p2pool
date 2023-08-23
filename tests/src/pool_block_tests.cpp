@@ -57,33 +57,41 @@ TEST(pool_block, deserialize)
 	int outputs_offset, outputs_blob_size;
 	const std::vector<uint8_t> mainchain_data = b.serialize_mainchain_data(&header_size, &miner_tx_size, &outputs_offset, &outputs_blob_size);
 
-	ASSERT_EQ(mainchain_data.size(), 1757);
-	ASSERT_EQ(header_size, 43);
-	ASSERT_EQ(miner_tx_size, 1457);
+	ASSERT_EQ(mainchain_data.size(), 1757U);
+	ASSERT_EQ(header_size, 43U);
+	ASSERT_EQ(miner_tx_size, 1457U);
 	ASSERT_EQ(outputs_offset, 54);
 	ASSERT_EQ(outputs_blob_size, 1371);
 
-	ASSERT_EQ(b.m_majorVersion, 16);
-	ASSERT_EQ(b.m_minorVersion, 16);
-	ASSERT_EQ(b.m_timestamp, 1679221824);
-	ASSERT_EQ(b.m_nonce, 1247);
-	ASSERT_EQ(b.m_txinGenHeight, 2845298);
-	ASSERT_EQ(b.m_outputs.size(), 35);
-	ASSERT_EQ(b.m_extraNonceSize, 4);
-	ASSERT_EQ(b.m_extraNonce, 1482827308);
-	ASSERT_EQ(b.m_transactions.size(), 9);
-	ASSERT_EQ(b.m_uncles.size(), 0);
-	ASSERT_EQ(b.m_sidechainHeight, 4674483);
-	ASSERT_EQ(b.m_difficulty.lo, 1854596983);
-	ASSERT_EQ(b.m_difficulty.hi, 0);
+	ASSERT_EQ(b.m_majorVersion, 16U);
+	ASSERT_EQ(b.m_minorVersion, 16U);
+	ASSERT_EQ(b.m_timestamp, 1679221824U);
+	ASSERT_EQ(b.m_nonce, 1247U);
+	ASSERT_EQ(b.m_txinGenHeight, 2845298U);
+	ASSERT_EQ(b.m_outputs.size(), 35U);
+	ASSERT_EQ(b.m_extraNonceSize, 4U);
+	ASSERT_EQ(b.m_extraNonce, 1482827308U);
+	ASSERT_EQ(b.m_transactions.size(), 9U);
+	ASSERT_EQ(b.m_uncles.size(), 0U);
+	ASSERT_EQ(b.m_sidechainHeight, 4674483U);
+	ASSERT_EQ(b.m_difficulty.lo, 1854596983U);
+	ASSERT_EQ(b.m_difficulty.hi, 0U);
 	ASSERT_EQ(b.m_cumulativeDifficulty.lo, 7172845253120126ull);
-	ASSERT_EQ(b.m_cumulativeDifficulty.hi, 0);
-	ASSERT_EQ(b.m_depth, 0);
+	ASSERT_EQ(b.m_cumulativeDifficulty.hi, 0U);
+	ASSERT_EQ(b.m_depth, 0U);
 	ASSERT_EQ(b.m_verified, false);
 	ASSERT_EQ(b.m_invalid, false);
 	ASSERT_EQ(b.m_broadcasted, false);
 	ASSERT_EQ(b.m_wantBroadcast, false);
 
+	hash seed;
+	{
+		std::stringstream s;
+		s << "6fc9c4a55eb513eb31955c084d9342e0082987f9e42da042449b7c9001176d3a";
+		s >> seed;
+	}
+
+#if defined(__FreeBSD__) || defined(__OpenBSD__)
 	class RandomX_Hasher_Test : public RandomX_Hasher_Base
 	{
 	public:
@@ -107,8 +115,12 @@ TEST(pool_block, deserialize)
 			return false;
 		}
 	} hasher;
+#else
+	RandomX_Hasher hasher(nullptr);
+	hasher.set_seed(seed);
+#endif
 
-	hash seed, pow_hash;
+	hash pow_hash;
 	ASSERT_EQ(b.get_pow_hash(&hasher, 0, seed, pow_hash), true);
 
 	std::stringstream s;
