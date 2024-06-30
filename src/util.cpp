@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -44,7 +44,13 @@ LOG_CATEGORY(Util)
 
 namespace p2pool {
 
-const char* VERSION = "v" STR2(P2POOL_VERSION_MAJOR) "." STR2(P2POOL_VERSION_MINOR) " (built"
+#if defined(P2POOL_VERSION_PATCH) && (P2POOL_VERSION_PATCH > 0)
+#define P2POOL_VERSION_PATCH_STR "." STR2(P2POOL_VERSION_PATCH)
+#else
+#define P2POOL_VERSION_PATCH_STR ""
+#endif
+
+const char* VERSION = "v" STR2(P2POOL_VERSION_MAJOR) "." STR2(P2POOL_VERSION_MINOR) P2POOL_VERSION_PATCH_STR " (built"
 #if defined(__clang__)
 	" with clang/" __clang_version__
 #elif defined(__GNUC__)
@@ -53,6 +59,20 @@ const char* VERSION = "v" STR2(P2POOL_VERSION_MAJOR) "." STR2(P2POOL_VERSION_MIN
 	" with MSVC/" STR2(_MSC_VER)
 #endif
 " on " __DATE__ ")";
+
+SoftwareID get_software_id(uint32_t value)
+{
+	switch (value) {
+	case static_cast<uint32_t>(SoftwareID::P2Pool):
+		return SoftwareID::P2Pool;
+
+	case static_cast<uint32_t>(SoftwareID::GoObserver):
+		return SoftwareID::GoObserver;
+
+	default:
+		return SoftwareID::Unknown;
+	}
+}
 
 const raw_ip raw_ip::localhost_ipv4 = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x01 };
 const raw_ip raw_ip::localhost_ipv6 = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
@@ -193,6 +213,7 @@ NOINLINE bool difficulty_type::check_pow(const hash& pow_hash) const
 std::ostream& operator<<(std::ostream& s, const difficulty_type& d)
 {
 	char buf[log::Stream::BUF_SIZE + 1];
+	// cppcheck-suppress uninitvar
 	log::Stream s1(buf);
 	s1 << d << '\0';
 	s << buf;
@@ -231,6 +252,7 @@ std::istream& operator>>(std::istream& s, difficulty_type& diff)
 std::ostream& operator<<(std::ostream& s, const hash& h)
 {
 	char buf[log::Stream::BUF_SIZE + 1];
+	// cppcheck-suppress uninitvar
 	log::Stream s1(buf);
 	s1 << h << '\0';
 	s << buf;
@@ -323,9 +345,13 @@ struct BackgroundJobTracker::Impl
 	{
 		MutexLock lock(m_lock);
 
-		auto it = m_jobs.insert({ name, 1 });
+		auto it = m_jobs.emplace(name, 1);
 		if (!it.second) {
-			++it.first->second;
+			const int32_t n = ++it.first->second;
+			// Print the warning only once as the number goes past 20
+			if (n == 20) {
+				LOGWARN(3, "Performance warning: there are " << n << " instances of " << name << " running in the background. This shouldn't be normally happening - check logs for other warnings and errors.");
+			}
 		}
 	}
 
@@ -339,8 +365,8 @@ struct BackgroundJobTracker::Impl
 			return;
 		}
 
-		--it->second;
-		if (it->second <= 0) {
+		const int32_t n = --it->second;
+		if (n <= 0) {
 			m_jobs.erase(it);
 		}
 	}
@@ -377,6 +403,7 @@ struct BackgroundJobTracker::Impl
 		}
 
 		char buf[log::Stream::BUF_SIZE + 1];
+		// cppcheck-suppress uninitvar
 		log::Stream s(buf);
 		for (const auto& job : m_jobs) {
 			s << '\n' << job.first << " (" << job.second << ')';
@@ -484,22 +511,29 @@ bool get_dns_txt_records_base(const std::string& host, Callback<void, const char
 	}
 
 #ifdef _WIN32
-	PDNS_RECORD pQueryResults;
-	if (DnsQuery(host.c_str(), DNS_TYPE_TEXT, DNS_QUERY_STANDARD, NULL, &pQueryResults, NULL) != 0) {
-		return false;
-	}
+	try {
+		PDNS_RECORD pQueryResults;
+		if (DnsQuery(host.c_str(), DNS_TYPE_TEXT, DNS_QUERY_STANDARD, NULL, &pQueryResults, NULL) != 0) {
+			return false;
+		}
 
-	for (PDNS_RECORD p = pQueryResults; p; p = p->pNext) {
-		for (size_t j = 0; j < p->Data.TXT.dwStringCount; ++j) {
-			const char* s = p->Data.TXT.pStringArray[j];
-			const size_t n = strlen(s);
-			if (n > 0) {
-				callback(s, n);
+		for (PDNS_RECORD p = pQueryResults; p; p = p->pNext) {
+			for (size_t j = 0; j < p->Data.TXT.dwStringCount; ++j) {
+				const char* s = p->Data.TXT.pStringArray[j];
+				if (s) {
+					const size_t n = strlen(s);
+					if (n > 0) {
+						callback(s, n);
+					}
+				}
 			}
 		}
-	}
 
-	DnsRecordListFree(pQueryResults, DnsFreeRecordList);
+		DnsRecordListFree(pQueryResults, DnsFreeRecordList);
+	}
+	catch (...) {
+		return false;
+	}
 
 	return true;
 #elif defined(HAVE_RES_QUERY)
@@ -602,10 +636,8 @@ bool str_to_ip(bool is_v6, const char* ip, raw_ip& result)
 			LOGERR(1, "failed to parse IPv4 address " << ip << ", error " << uv_err_name(err));
 			return false;
 		}
-		result = {};
-		result.data[10] = 0xFF;
-		result.data[11] = 0xFF;
-		memcpy(result.data + 12, &addr4->sin_addr, sizeof(in_addr));
+		memcpy(result.data, raw_ip::ipv4_prefix, sizeof(raw_ip::ipv4_prefix));
+		memcpy(result.data + sizeof(raw_ip::ipv4_prefix), &addr4->sin_addr, sizeof(in_addr));
 	}
 
 	return true;
@@ -708,23 +740,15 @@ int add_portmapping(int external_port, int internal_port)
 	UPNPUrls urls;
 	IGDdatas data;
 	char local_addr[64] = {};
+	char wan_addr[64] = {};
 
-	int result = UPNP_GetValidIGD(upnp_discover.devlist, &urls, &data, local_addr, sizeof(local_addr));
+	int result = UPNP_GetValidIGD(upnp_discover.devlist, &urls, &data, local_addr, sizeof(local_addr), wan_addr, sizeof(wan_addr));
 	if (result != 1) {
 		LOGWARN(1, "UPNP_GetValidIGD returned " << result << ", no valid UPnP IGD devices found");
 		return 0;
 	}
 
-	LOGINFO(1, "UPnP: LAN IP address " << log::Gray() << static_cast<const char*>(local_addr));
-
-	char ext_addr[64] = {};
-	result = UPNP_GetExternalIPAddress(urls.controlURL, data.first.servicetype, ext_addr);
-	if ((result != UPNPCOMMAND_SUCCESS) || !ext_addr[0]) {
-		LOGWARN(1, "UPNP_GetExternalIPAddress: failed to query external IP address, error " << result);
-	}
-	else {
-		LOGINFO(1, "UPnP: WAN IP address " << log::Gray() << static_cast<const char*>(ext_addr));
-	}
+	LOGINFO(1, "UPnP: LAN IP address " << log::Gray() << static_cast<const char*>(local_addr) << log::NoColor() << ", WAN IP address " << log::Gray() << static_cast<const char*>(wan_addr));
 
 	char eport[16] = {};
 	do { log::Stream s(eport); s << external_port; } while (0);
@@ -754,7 +778,7 @@ int add_portmapping(int external_port, int internal_port)
 		return 0;
 	}
 
-	LOGINFO(1, "UPnP: Mapped " << log::Gray() << static_cast<const char*>(ext_addr) << ':' << external_port << log::NoColor() << " to " << log::Gray() << static_cast<const char*>(local_addr) << ':' << internal_port);
+	LOGINFO(1, "UPnP: Mapped " << log::Gray() << static_cast<const char*>(wan_addr) << ':' << external_port << log::NoColor() << " to " << log::Gray() << static_cast<const char*>(local_addr) << ':' << internal_port);
 	return external_port;
 }
 
@@ -773,7 +797,7 @@ void remove_portmapping(int external_port)
 	IGDdatas data;
 	char local_addr[64] = {};
 
-	int result = UPNP_GetValidIGD(upnp_discover.devlist, &urls, &data, local_addr, sizeof(local_addr));
+	int result = UPNP_GetValidIGD(upnp_discover.devlist, &urls, &data, local_addr, sizeof(local_addr), nullptr, 0);
 	if (result != 1) {
 		LOGWARN(1, "UPNP_GetValidIGD returned " << result << ", no valid UPnP IGD devices found");
 		return;

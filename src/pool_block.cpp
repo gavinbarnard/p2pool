@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -21,6 +21,7 @@
 #include "side_chain.h"
 #include "pow_hash.h"
 #include "crypto.h"
+#include "merkle.h"
 
 LOG_CATEGORY(PoolBlock)
 
@@ -38,12 +39,18 @@ PoolBlock::PoolBlock()
 	, m_txkeyPub{}
 	, m_extraNonceSize(0)
 	, m_extraNonce(0)
+	, m_merkleTreeDataSize(1)
+	, m_merkleTreeData(0)
+	, m_merkleRoot{}
 	, m_txkeySecSeed{}
 	, m_txkeySec{}
 	, m_parent{}
 	, m_sidechainHeight(0)
 	, m_difficulty{}
 	, m_cumulativeDifficulty{}
+	, m_merkleProof{}
+	, m_merkleProofPath(0)
+	, m_mergeMiningExtra{}
 	, m_sidechainExtraBuf{}
 	, m_sidechainId{}
 	, m_depth(0)
@@ -54,6 +61,7 @@ PoolBlock::PoolBlock()
 	, m_precalculated(false)
 	, m_localTimestamp(seconds_since_epoch())
 	, m_receivedTimestamp(0)
+	, m_auxNonce(0)
 {
 }
 
@@ -84,6 +92,9 @@ PoolBlock& PoolBlock::operator=(const PoolBlock& b)
 	m_txkeyPub = b.m_txkeyPub;
 	m_extraNonceSize = b.m_extraNonceSize;
 	m_extraNonce = b.m_extraNonce;
+	m_merkleTreeDataSize = b.m_merkleTreeDataSize;
+	m_merkleTreeData = b.m_merkleTreeData;
+	m_merkleRoot = b.m_merkleRoot;
 	m_transactions = b.m_transactions;
 	m_minerWallet = b.m_minerWallet;
 	m_txkeySecSeed = b.m_txkeySecSeed;
@@ -93,6 +104,9 @@ PoolBlock& PoolBlock::operator=(const PoolBlock& b)
 	m_sidechainHeight = b.m_sidechainHeight;
 	m_difficulty = b.m_difficulty;
 	m_cumulativeDifficulty = b.m_cumulativeDifficulty;
+	m_merkleProof = b.m_merkleProof;
+	m_merkleProofPath = b.m_merkleProofPath;
+	m_mergeMiningExtra = b.m_mergeMiningExtra;
 	memcpy(m_sidechainExtraBuf, b.m_sidechainExtraBuf, sizeof(m_sidechainExtraBuf));
 	m_sidechainId = b.m_sidechainId;
 	m_depth = b.m_depth;
@@ -104,6 +118,9 @@ PoolBlock& PoolBlock::operator=(const PoolBlock& b)
 
 	m_localTimestamp = seconds_since_epoch();
 	m_receivedTimestamp = b.m_receivedTimestamp;
+
+	m_auxChains = b.m_auxChains;
+	m_auxNonce = b.m_auxNonce;
 
 	return *this;
 }
@@ -186,9 +203,18 @@ std::vector<uint8_t> PoolBlock::serialize_mainchain_data(size_t* header_size, si
 	}
 
 	*(p++) = TX_EXTRA_MERGE_MINING_TAG;
-	*(p++) = HASH_SIZE;
-	memcpy(p, m_sidechainId.h, HASH_SIZE);
-	p += HASH_SIZE;
+
+	if (!merge_mining_enabled()) {
+		*(p++) = HASH_SIZE;
+		memcpy(p, m_sidechainId.h, HASH_SIZE);
+		p += HASH_SIZE;
+	}
+	else {
+		*(p++) = static_cast<uint8_t>(m_merkleTreeDataSize + HASH_SIZE);
+		writeVarint(m_merkleTreeData, [&p](const uint8_t b) { *(p++) = b; });
+		memcpy(p, m_merkleRoot.h, HASH_SIZE);
+		p += HASH_SIZE;
+	}
 
 	writeVarint(static_cast<size_t>(p - tx_extra), data);
 	data.insert(data.end(), tx_extra, p);
@@ -241,6 +267,25 @@ std::vector<uint8_t> PoolBlock::serialize_sidechain_data() const
 	writeVarint(m_cumulativeDifficulty.lo, data);
 	writeVarint(m_cumulativeDifficulty.hi, data);
 
+	if (merge_mining_enabled()) {
+		const uint8_t n = static_cast<uint8_t>(m_merkleProof.size());
+		data.push_back(n);
+
+		for (uint8_t i = 0; i < n; ++i) {
+			const hash& h = m_merkleProof[i];
+			data.insert(data.end(), h.h, h.h + HASH_SIZE);
+		}
+
+		writeVarint(m_mergeMiningExtra.size(), data);
+
+		for (const auto& mm_extra_data : m_mergeMiningExtra) {
+			data.insert(data.end(), mm_extra_data.first.h, mm_extra_data.first.h + HASH_SIZE);
+
+			writeVarint(mm_extra_data.second.size(), data);
+			data.insert(data.end(), mm_extra_data.second.begin(), mm_extra_data.second.end());
+		}
+	}
+
 	const uint8_t* p = reinterpret_cast<const uint8_t*>(m_sidechainExtraBuf);
 	data.insert(data.end(), p, p + sizeof(m_sidechainExtraBuf));
 
@@ -269,6 +314,11 @@ void PoolBlock::reset_offchain_data()
 
 	m_localTimestamp = seconds_since_epoch();
 	m_receivedTimestamp = 0;
+
+	m_auxChains.clear();
+	m_auxChains.shrink_to_fit();
+
+	m_auxNonce = 0;
 }
 
 bool PoolBlock::get_pow_hash(RandomX_Hasher_Base* hasher, uint64_t height, const hash& seed_hash, hash& pow_hash, bool force_light_mode)
@@ -311,39 +361,9 @@ bool PoolBlock::get_pow_hash(RandomX_Hasher_Base* hasher, uint64_t height, const
 		keccak(reinterpret_cast<uint8_t*>(hashes), HASH_SIZE * 3, tmp.h);
 		memcpy(h, tmp.h, HASH_SIZE);
 
-		if (count == 1) {
-			memcpy(blob + blob_size, h, HASH_SIZE);
-		}
-		else if (count == 2) {
-			keccak(h, HASH_SIZE * 2, tmp.h);
-			memcpy(blob + blob_size, tmp.h, HASH_SIZE);
-		}
-		else {
-			size_t i, j, cnt;
-
-			for (i = 0, cnt = 1; cnt <= count; ++i, cnt <<= 1) {}
-
-			cnt >>= 1;
-
-			std::vector<uint8_t> tmp_ints(cnt * HASH_SIZE);
-			memcpy(tmp_ints.data(), h, (cnt * 2 - count) * HASH_SIZE);
-
-			for (i = cnt * 2 - count, j = cnt * 2 - count; j < cnt; i += 2, ++j) {
-				keccak(h + i * HASH_SIZE, HASH_SIZE * 2, tmp.h);
-				memcpy(tmp_ints.data() + j * HASH_SIZE, tmp.h, HASH_SIZE);
-			}
-
-			while (cnt > 2) {
-				cnt >>= 1;
-				for (i = 0, j = 0; j < cnt; i += 2, ++j) {
-					keccak(tmp_ints.data() + i * HASH_SIZE, HASH_SIZE * 2, tmp.h);
-					memcpy(tmp_ints.data() + j * HASH_SIZE, tmp.h, HASH_SIZE);
-				}
-			}
-
-			keccak(tmp_ints.data(), HASH_SIZE * 2, tmp.h);
-			memcpy(blob + blob_size, tmp.h, HASH_SIZE);
-		}
+		root_hash tmp_root;
+		merkle_hash(m_transactions, tmp_root);
+		memcpy(blob + blob_size, tmp_root.h, HASH_SIZE);
 	}
 	blob_size += HASH_SIZE;
 
@@ -400,6 +420,22 @@ hash PoolBlock::calculate_tx_key_seed() const
 	}, static_cast<int>(sizeof(domain) + mainchain_data.size() + sidechain_data.size()), result.h, HASH_SIZE);
 
 	return result;
+}
+
+bool PoolBlock::merge_mining_enabled() const
+{
+#ifdef P2POOL_UNIT_TESTS
+	return false;
+#else
+	switch (SideChain::network_type()) {
+	case NetworkType::Mainnet:
+		return m_timestamp >= MERGE_MINING_FORK_TIME;
+	case NetworkType::Testnet:
+		return m_timestamp >= MERGE_MINING_TESTNET_FORK_TIME;
+	default:
+		return false;
+	}
+#endif
 }
 
 } // namespace p2pool

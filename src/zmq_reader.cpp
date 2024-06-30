@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -51,7 +51,7 @@ ZMQReader::ZMQReader(const std::string& address, uint32_t zmq_port, const std::s
 			break;
 		}
 		catch (const std::exception& e) {
-			LOGWARN(1, "failed to to bind port " << i << " for ZMQ publisher, error " << e.what());
+			LOGWARN(1, "failed to to bind port " << port << " for ZMQ publisher, error " << e.what());
 		}
 	}
 
@@ -210,6 +210,7 @@ bool ZMQReader::connect(const std::string& address, bool keep_monitor)
 	}
 
 	char buf[64];
+	// cppcheck-suppress uninitvar
 	log::Stream s(buf);
 	s << "inproc://p2pool-connect-mon-" << id << '\0';
 	++id;

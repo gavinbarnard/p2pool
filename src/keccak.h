@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -24,25 +24,30 @@ enum KeccakParams {
 	ROUNDS = 24,
 };
 
-void keccakf(uint64_t (&st)[25]);
-void keccak_step(const uint8_t* &in, int &inlen, uint64_t (&st)[25]);
-void keccak_finish(const uint8_t* in, int inlen, uint64_t (&st)[25]);
+extern const uint64_t keccakf_rndc[24];
+extern void (*keccakf)(std::array<uint64_t, 25>& st);
+
+void keccakf_plain(std::array<uint64_t, 25>& st);
+void keccakf_bmi(std::array<uint64_t, 25>& st);
+
+void keccak_step(const uint8_t* &in, int &inlen, std::array<uint64_t, 25>& st);
+void keccak_finish(const uint8_t* in, int inlen, std::array<uint64_t, 25>& st);
 
 template<size_t N>
 FORCEINLINE void keccak(const uint8_t* in, int inlen, uint8_t (&md)[N])
 {
 	static_assert((N == 32) || (N == 200), "invalid size");
 
-	uint64_t st[25] = {};
+	std::array<uint64_t, 25> st = {};
 	keccak_step(in, inlen, st);
 	keccak_finish(in, inlen, st);
-	memcpy(md, st, N);
+	memcpy(md, st.data(), N);
 }
 
 template<typename T>
 FORCEINLINE void keccak_custom(T&& in, int inlen, uint8_t* md, int mdlen)
 {
-	uint64_t st[25] = {};
+	std::array<uint64_t, 25> st = {};
 
 	const int rsiz = sizeof(st) == mdlen ? KeccakParams::HASH_DATA_AREA : 200 - 2 * mdlen;
 	const int rsizw = rsiz / 8;
@@ -77,7 +82,7 @@ FORCEINLINE void keccak_custom(T&& in, int inlen, uint8_t* md, int mdlen)
 
 	keccakf(st);
 
-	memcpy(md, st, mdlen);
+	memcpy(md, st.data(), mdlen);
 }
 
 } // namespace p2pool

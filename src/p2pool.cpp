@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -36,6 +36,8 @@
 #include "p2pool_api.h"
 #include "pool_block.h"
 #include "keccak.h"
+#include "merkle.h"
+#include "merge_mining_client.h"
 #include <thread>
 #include <fstream>
 #include <numeric>
@@ -62,6 +64,13 @@ p2pool::p2pool(int argc, char* argv[])
 	LOGINFO(1, log::LightCyan() << VERSION);
 
 	Params* p = new Params(argc, argv);
+
+	if (!p->valid()) {
+		LOGERR(1, "Invalid or missing command line. Try \"p2pool --help\".");
+		delete p;
+		throw std::exception();
+	}
+
 	m_params = p;
 
 #ifdef WITH_UPNP
@@ -105,6 +114,13 @@ p2pool::p2pool(int argc, char* argv[])
 	}
 	m_submitBlockAsync.data = this;
 
+	err = uv_async_init(uv_default_loop_checked(), &m_submitAuxBlockAsync, on_submit_aux_block);
+	if (err) {
+		LOGERR(1, "uv_async_init failed, error " << uv_err_name(err));
+		throw std::exception();
+	}
+	m_submitAuxBlockAsync.data = this;
+
 	err = uv_async_init(uv_default_loop_checked(), &m_blockTemplateAsync, on_update_block_template);
 	if (err) {
 		LOGERR(1, "uv_async_init failed, error " << uv_err_name(err));
@@ -129,11 +145,14 @@ p2pool::p2pool(int argc, char* argv[])
 	uv_rwlock_init_checked(&m_mainchainLock);
 	uv_rwlock_init_checked(&m_minerDataLock);
 	uv_rwlock_init_checked(&m_ZMQReaderLock);
+	uv_rwlock_init_checked(&m_mergeMiningClientsLock);
+	uv_rwlock_init_checked(&m_auxIdLock);
 	uv_mutex_init_checked(&m_foundBlocksLock);
 #ifdef WITH_RANDOMX
 	uv_mutex_init_checked(&m_minerLock);
 #endif
 	uv_mutex_init_checked(&m_submitBlockDataLock);
+	uv_mutex_init_checked(&m_submitAuxBlockDataLock);
 
 	m_api = p->m_apiPath.empty() ? nullptr : new p2pool_api(p->m_apiPath, p->m_localStats);
 
@@ -185,14 +204,26 @@ p2pool::~p2pool()
 	}
 #endif
 
+	{
+		WriteLock lock(m_mergeMiningClientsLock);
+
+		for (const IMergeMiningClient* c : m_mergeMiningClients) {
+			delete c;
+		}
+		m_mergeMiningClients.clear();
+	}
+
 	uv_rwlock_destroy(&m_mainchainLock);
 	uv_rwlock_destroy(&m_minerDataLock);
 	uv_rwlock_destroy(&m_ZMQReaderLock);
+	uv_rwlock_destroy(&m_mergeMiningClientsLock);
+	uv_rwlock_destroy(&m_auxIdLock);
 	uv_mutex_destroy(&m_foundBlocksLock);
 #ifdef WITH_RANDOMX
 	uv_mutex_destroy(&m_minerLock);
 #endif
 	uv_mutex_destroy(&m_submitBlockDataLock);
+	uv_mutex_destroy(&m_submitAuxBlockDataLock);
 
 	delete m_api;
 	delete m_sideChain;
@@ -280,6 +311,15 @@ void p2pool::print_miner_status()
 }
 #endif
 
+void p2pool::print_merge_mining_status() const
+{
+	ReadLock lock(m_mergeMiningClientsLock);
+
+	for (const IMergeMiningClient* client : m_mergeMiningClients) {
+		client->print_status();
+	}
+}
+
 void p2pool::handle_tx(TxMempoolData& tx)
 {
 	if (!tx.weight || !tx.fee) {
@@ -337,10 +377,13 @@ void p2pool::handle_miner_data(MinerData& data)
 	data.time_received = std::chrono::high_resolution_clock::now();
 	{
 		WriteLock lock(m_minerDataLock);
+		data.aux_chains = m_minerData.aux_chains;
+		data.aux_nonce = m_minerData.aux_nonce;
 		m_minerData = data;
 	}
 	m_updateSeed = true;
 	update_median_timestamp();
+	update_aux_data(hash());
 
 	const Params::Host& host = current_host();
 
@@ -354,7 +397,7 @@ void p2pool::handle_miner_data(MinerData& data)
 		"\ndifficulty              = " << data.difficulty <<
 		"\nmedian_weight           = " << data.median_weight <<
 		"\nalready_generated_coins = " << data.already_generated_coins <<
-		"\ntransactions            = " << m_mempool->m_transactions.size() <<
+		"\ntransactions            = " << m_mempool->size() <<
 		"\n---------------------------------------------------------------------------------------------------------------"
 	);
 
@@ -440,7 +483,7 @@ void p2pool::handle_chain_main(ChainMain& data, const char* extra)
 	}
 	update_median_timestamp();
 
-	hash sidechain_id;
+	root_hash merkle_root;
 	if (extra) {
 		const size_t n = strlen(extra);
 		if (n >= HASH_SIZE * 2) {
@@ -448,10 +491,10 @@ void p2pool::handle_chain_main(ChainMain& data, const char* extra)
 			for (size_t i = 0; i < HASH_SIZE; ++i) {
 				uint8_t d[2];
 				if (!from_hex(s[i * 2], d[0]) || !from_hex(s[i * 2 + 1], d[1])) {
-					sidechain_id = {};
+					merkle_root = {};
 					break;
 				}
-				sidechain_id.h[i] = (d[0] << 4) | d[1];
+				merkle_root.h[i] = (d[0] << 4) | d[1];
 			}
 		}
 	}
@@ -461,8 +504,8 @@ void p2pool::handle_chain_main(ChainMain& data, const char* extra)
 		", timestamp = " << log::Gray() << data.timestamp << log::NoColor() << 
 		", reward = " << log::Gray() << log::XMRAmount(data.reward));
 
-	if (!sidechain_id.empty()) {
-		const PoolBlock* block = side_chain().find_block(sidechain_id);
+	if (!merkle_root.empty()) {
+		const PoolBlock* block = side_chain().find_block_by_merkle_root(merkle_root);
 		if (block) {
 			const Wallet& w = params().m_wallet;
 
@@ -480,13 +523,77 @@ void p2pool::handle_chain_main(ChainMain& data, const char* extra)
 			api_update_block_found(&data, block);
 		}
 		else {
-			side_chain().watch_mainchain_block(data, sidechain_id);
+			side_chain().watch_mainchain_block(data, merkle_root);
 		}
 	}
 
 	api_update_network_stats();
 
 	m_zmqLastActive = seconds_since_epoch();
+}
+
+void p2pool::update_aux_data(const hash& chain_id)
+{
+	MinerData data;
+	std::vector<hash> aux_id;
+
+	{
+		ReadLock lock(m_mergeMiningClientsLock);
+
+		if (!m_mergeMiningClients.empty()) {
+			data.aux_chains.reserve(m_mergeMiningClients.size());
+
+			aux_id.reserve(m_mergeMiningClients.size() + 1);
+
+			IMergeMiningClient::ChainParameters params;
+
+			for (const IMergeMiningClient* c : m_mergeMiningClients) {
+				if (c->get_params(params)) {
+					data.aux_chains.emplace_back(params.aux_id, params.aux_hash, params.aux_diff);
+					aux_id.emplace_back(params.aux_id);
+				}
+			}
+			aux_id.emplace_back(m_sideChain->consensus_hash());
+		}
+	}
+
+	if (!aux_id.empty()) {
+		WriteLock lock(m_auxIdLock);
+
+		if (aux_id == m_auxId) {
+			data.aux_nonce = m_auxNonce;
+		}
+		else if (find_aux_nonce(aux_id, data.aux_nonce)) {
+			m_auxId = std::move(aux_id);
+			m_auxNonce = data.aux_nonce;
+		}
+		else {
+			LOGERR(1, "Failed to find the aux nonce for merge mining. Merge mining will be off this round.");
+			data.aux_chains.clear();
+		}
+	}
+
+	{
+		WriteLock lock(m_minerDataLock);
+
+		if ((m_minerData.aux_nonce == data.aux_nonce) && (m_minerData.aux_chains == data.aux_chains)) {
+			return;
+		}
+
+		m_minerData.aux_chains = data.aux_chains;
+		m_minerData.aux_nonce = data.aux_nonce;
+		LOGINFO(5, "update_aux_data: n_aux_chains = " << m_minerData.aux_chains.size() << ", aux_nonce = " << m_minerData.aux_nonce);
+	}
+
+	if (!chain_id.empty()) {
+		LOGINFO(4, "New aux data from chain " << chain_id);
+		if (!is_main_thread()) {
+			update_block_template_async();
+		}
+		else {
+			update_block_template();
+		}
+	}
 }
 
 void p2pool::submit_block_async(uint32_t template_id, uint32_t nonce, uint32_t extra_nonce)
@@ -537,6 +644,106 @@ void p2pool::submit_block_async(std::vector<uint8_t>&& blob)
 	}
 }
 
+void p2pool::submit_aux_block_async(const std::vector<SubmitAuxBlockData>& aux_blocks)
+{
+	{
+		MutexLock lock(m_submitAuxBlockDataLock);
+		m_submitAuxBlockData.insert(m_submitAuxBlockData.end(), aux_blocks.begin(), aux_blocks.end());
+	}
+
+	// If p2pool is stopped, m_submitAuxBlockAsync is most likely already closed
+	if (m_stopped) {
+		LOGWARN(0, "p2pool is shutting down, but a block was found. Trying to submit it anyway!");
+		submit_aux_block();
+		return;
+	}
+
+	const int err = uv_async_send(&m_submitAuxBlockAsync);
+	if (err) {
+		LOGERR(1, "uv_async_send failed, error " << uv_err_name(err));
+	}
+}
+
+void p2pool::submit_aux_block() const
+{
+	std::vector<SubmitAuxBlockData> submit_data;
+	{
+		MutexLock lock(m_submitAuxBlockDataLock);
+		m_submitAuxBlockData.swap(submit_data);
+	}
+
+	for (size_t i = 0; i < submit_data.size(); ++i) {
+		const hash chain_id = submit_data[i].chain_id;
+		const uint32_t template_id = submit_data[i].template_id;
+		const uint32_t nonce = submit_data[i].nonce;
+		const uint32_t extra_nonce = submit_data[i].extra_nonce;
+
+		LOGINFO(3, "submit_aux_block: template id = " << template_id << ", chain_id = " << chain_id << ", nonce = " << nonce << ", extra_nonce = " << extra_nonce);
+
+		size_t nonce_offset = 0;
+		size_t extra_nonce_offset = 0;
+		size_t merkle_root_offset = 0;
+		root_hash merge_mining_root;
+		const BlockTemplate* block_tpl = nullptr;
+
+		std::vector<uint8_t> blob = m_blockTemplate->get_block_template_blob(template_id, extra_nonce, nonce_offset, extra_nonce_offset, merkle_root_offset, merge_mining_root, &block_tpl);
+
+		uint8_t hashing_blob[128] = {};
+		uint64_t height = 0;
+		difficulty_type diff, aux_diff, sidechain_diff;
+		hash seed_hash;
+
+		m_blockTemplate->get_hashing_blob(template_id, extra_nonce, hashing_blob, height, diff, aux_diff, sidechain_diff, seed_hash, nonce_offset);
+
+		if (blob.empty()) {
+			LOGWARN(3, "submit_aux_block: block template blob not found");
+			return;
+		}
+
+		uint8_t* p = blob.data();
+		memcpy(p + nonce_offset, &nonce, NONCE_SIZE);
+		memcpy(p + extra_nonce_offset, &extra_nonce, EXTRA_NONCE_SIZE);
+		memcpy(p + merkle_root_offset, merge_mining_root.h, HASH_SIZE);
+
+		ReadLock lock(m_mergeMiningClientsLock);
+
+		IMergeMiningClient::ChainParameters chain_params;
+
+		for (IMergeMiningClient* c : m_mergeMiningClients) {
+			if (!c->get_params(chain_params)) {
+				continue;
+			}
+
+			if (chain_id == chain_params.aux_id) {
+				std::vector<hash> proof;
+				uint32_t path;
+
+				if (m_blockTemplate->get_aux_proof(template_id, extra_nonce, chain_params.aux_hash, proof, path)) {
+					if (pool_block_debug()) {
+						const MinerData data = miner_data();
+						const uint32_t n_aux_chains = static_cast<uint32_t>(data.aux_chains.size() + 1);
+						const uint32_t index = get_aux_slot(chain_params.aux_id, data.aux_nonce, n_aux_chains);
+
+						if (!verify_merkle_proof(chain_params.aux_hash, proof, index, n_aux_chains, merge_mining_root)) {
+							LOGERR(0, "submit_aux_block: verify_merkle_proof (1) failed for chain_id " << chain_id);
+						}
+						if (!verify_merkle_proof(chain_params.aux_hash, proof, path, merge_mining_root)) {
+							LOGERR(0, "submit_aux_block: verify_merkle_proof (2) failed for chain_id " << chain_id);
+						}
+					}
+
+					c->submit_solution(block_tpl, hashing_blob, nonce_offset, seed_hash, blob, proof, path);
+				}
+				else {
+					LOGWARN(3, "submit_aux_block: failed to get merkle proof for chain_id " << chain_id);
+				}
+
+				break;
+			}
+		}
+	}
+}
+
 bool init_signals(p2pool* pool, bool init);
 
 void p2pool::on_stop(uv_async_t* async)
@@ -550,6 +757,7 @@ void p2pool::on_stop(uv_async_t* async)
 	}
 
 	uv_close(reinterpret_cast<uv_handle_t*>(&pool->m_submitBlockAsync), nullptr);
+	uv_close(reinterpret_cast<uv_handle_t*>(&pool->m_submitAuxBlockAsync), nullptr);
 	uv_close(reinterpret_cast<uv_handle_t*>(&pool->m_blockTemplateAsync), nullptr);
 	uv_close(reinterpret_cast<uv_handle_t*>(&pool->m_stopAsync), nullptr);
 	uv_close(reinterpret_cast<uv_handle_t*>(&pool->m_reconnectToHostAsync), nullptr);
@@ -574,18 +782,20 @@ void p2pool::submit_block() const
 
 	size_t nonce_offset = 0;
 	size_t extra_nonce_offset = 0;
-	size_t sidechain_id_offset = 0;
-	hash sidechain_id;
+	size_t merkle_root_offset = 0;
+	hash merge_mining_root;
+	const BlockTemplate* block_tpl = nullptr;
+
 	bool is_external = false;
 
 	if (submit_data.blob.empty()) {
-		submit_data.blob = m_blockTemplate->get_block_template_blob(submit_data.template_id, submit_data.extra_nonce, nonce_offset, extra_nonce_offset, sidechain_id_offset, sidechain_id);
+		submit_data.blob = m_blockTemplate->get_block_template_blob(submit_data.template_id, submit_data.extra_nonce, nonce_offset, extra_nonce_offset, merkle_root_offset, merge_mining_root, &block_tpl);
 
 		LOGINFO(0, log::LightGreen() << "submit_block: height = " << height
 			<< ", template id = " << submit_data.template_id
 			<< ", nonce = " << submit_data.nonce
 			<< ", extra_nonce = " << submit_data.extra_nonce
-			<< ", id = " << sidechain_id);
+			<< ", mm_root = " << merge_mining_root);
 
 		if (submit_data.blob.empty()) {
 			LOGERR(0, "submit_block: couldn't find block template with id " << submit_data.template_id);
@@ -616,8 +826,8 @@ void p2pool::submit_block() const
 			b = submit_data.extra_nonce & 255;
 			submit_data.extra_nonce >>= 8;
 		}
-		else if (sidechain_id_offset && sidechain_id_offset <= i && i < sidechain_id_offset + HASH_SIZE) {
-			b = sidechain_id.h[i - sidechain_id_offset];
+		else if (merkle_root_offset && merkle_root_offset <= i && i < merkle_root_offset + HASH_SIZE) {
+			b = merge_mining_root.h[i - merkle_root_offset];
 		}
 		else {
 			b = submit_data.blob[i];
@@ -630,7 +840,7 @@ void p2pool::submit_block() const
 	const Params::Host& host = current_host();
 
 	JSONRPCRequest::call(host.m_address, host.m_rpcPort, request, host.m_rpcLogin, m_params->m_socks5Proxy,
-		[height, diff, template_id, nonce, extra_nonce, sidechain_id, is_external](const char* data, size_t size, double)
+		[height, diff, template_id, nonce, extra_nonce, merge_mining_root, is_external](const char* data, size_t size, double)
 		{
 			rapidjson::Document doc;
 			if (doc.Parse(data, size).HasParseError() || !doc.IsObject()) {
@@ -657,7 +867,7 @@ void p2pool::submit_block() const
 					LOGWARN(3, "submit_block (external blob): daemon returned error: " << (error_msg ? error_msg : "unknown error"));
 				}
 				else {
-					LOGERR(0, "submit_block: daemon returned error: '" << (error_msg ? error_msg : "unknown error") << "', template id = " << template_id << ", nonce = " << nonce << ", extra_nonce = " << extra_nonce << ", id = " << sidechain_id);
+					LOGERR(0, "submit_block: daemon returned error: '" << (error_msg ? error_msg : "unknown error") << "', template id = " << template_id << ", nonce = " << nonce << ", extra_nonce = " << extra_nonce << ", mm_root = " << merge_mining_root);
 				}
 				return;
 			}
@@ -816,6 +1026,19 @@ void p2pool::download_block_headers(uint64_t current_height)
 						}
 					}
 
+					{
+						WriteLock lock(m_mergeMiningClientsLock);
+
+						m_mergeMiningClients.clear();
+
+						for (const auto& h : m_params->m_mergeMiningHosts) {
+							IMergeMiningClient* c = IMergeMiningClient::create(this, h.m_host, h.m_wallet);
+							if (c) {
+								m_mergeMiningClients.push_back(c);
+							}
+						}
+					}
+
 					m_startupFinished = true;
 				}
 			}
@@ -913,7 +1136,7 @@ void p2pool::get_info()
 		[this, host](const char* data, size_t size, double)
 		{
 			if (size > 0) {
-				LOGWARN(1, "get_info RPC request to " << host.m_displayName << " failed: error " << log::const_buf(data, size) << ", trying again in 1 second");
+				LOGWARN(1, "get_info RPC request to host " << host.m_displayName << " failed: error " << log::const_buf(data, size) << ", trying again in 1 second");
 				if (!m_stopped) {
 					std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 					switch_host();
@@ -925,7 +1148,7 @@ void p2pool::get_info()
 
 void p2pool::load_found_blocks()
 {
-	if (!m_api) {
+	if (!m_api || m_stopped) {
 		return;
 	}
 
@@ -970,7 +1193,7 @@ void p2pool::parse_get_info_rpc(const char* data, size_t size)
 	rapidjson::Document doc;
 	doc.Parse(data, size);
 
-	if (!doc.IsObject() || !doc.HasMember("result")) {
+	if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("result")) {
 		LOGWARN(1, "get_info RPC response is invalid (\"result\" not found), trying again in 1 second");
 		std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 		get_info();
@@ -1047,7 +1270,7 @@ void p2pool::parse_get_version_rpc(const char* data, size_t size)
 	rapidjson::Document doc;
 	doc.Parse(data, size);
 
-	if (!doc.IsObject() || !doc.HasMember("result")) {
+	if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("result")) {
 		LOGWARN(1, "get_version RPC response is invalid (\"result\" not found), trying again in 1 second");
 		std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 		get_version();
@@ -1107,16 +1330,15 @@ void p2pool::get_miner_data(bool retry)
 		[this, host, retry](const char* data, size_t size, double)
 		{
 			if (size > 0) {
-				LOGWARN(1, "get_miner_data RPC request to " << host.m_displayName << " failed: error " << log::const_buf(data, size) << (retry ? ", trying again in 1 second" : ""));
+				LOGWARN(1, "get_miner_data RPC request to host " << host.m_displayName << " failed: error " << log::const_buf(data, size) << (retry ? ", trying again in 1 second" : ""));
 				if (!m_stopped && retry) {
 					std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 					m_getMinerDataPending = false;
 					get_miner_data();
+					return;
 				}
 			}
-			else {
-				m_getMinerDataPending = false;
-			}
+			m_getMinerDataPending = false;
 		});
 }
 
@@ -1137,7 +1359,7 @@ void p2pool::parse_get_miner_data_rpc(const char* data, size_t size)
 	rapidjson::Document doc;
 	doc.Parse(data, size);
 
-	if (!doc.IsObject() || !doc.HasMember("result")) {
+	if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("result")) {
 		LOGWARN(1, "get_miner_data RPC response is invalid, skipping it");
 		return;
 	}
@@ -1277,7 +1499,7 @@ uint32_t p2pool::parse_block_headers_range(const char* data, size_t size)
 
 void p2pool::api_update_network_stats()
 {
-	if (!m_api) {
+	if (!m_api || m_stopped) {
 		return;
 	}
 
@@ -1308,7 +1530,7 @@ void p2pool::api_update_network_stats()
 
 void p2pool::api_update_pool_stats()
 {
-	if (!m_api) {
+	if (!m_api || m_stopped) {
 		return;
 	}
 
@@ -1360,7 +1582,7 @@ void p2pool::api_update_pool_stats()
 
 void p2pool::api_update_stats_mod()
 {
-	if (!m_api) {
+	if (!m_api || m_stopped) {
 		return;
 	}
 
@@ -1393,6 +1615,7 @@ void p2pool::api_update_stats_mod()
 	}
 
 	char last_block_found_buf[log::Stream::BUF_SIZE + 1];
+	// cppcheck-suppress uninitvar
 	log::Stream s(last_block_found_buf);
 	s << last_block_found_hash << '\0';
 	memcpy(last_block_found_buf + 4, "...", 4);
@@ -1453,7 +1676,7 @@ void p2pool::cleanup_mainchain_data(uint64_t height)
 
 void p2pool::api_update_block_found(const ChainMain* data, const PoolBlock* block)
 {
-	if (!m_api) {
+	if (!m_api || m_stopped) {
 		return;
 	}
 

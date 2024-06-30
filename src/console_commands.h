@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -28,12 +28,12 @@ class ConsoleCommands : public TCPServer
 {
 public:
 	explicit ConsoleCommands(p2pool* pool);
-	~ConsoleCommands();
+	~ConsoleCommands() override;
 
 	struct ConsoleClient : public Client
 	{
 		ConsoleClient() : Client(m_consoleReadBuf, sizeof(m_consoleReadBuf)) {}
-		~ConsoleClient() {}
+		~ConsoleClient() override {}
 
 		static Client* allocate() { return new ConsoleClient(); }
 

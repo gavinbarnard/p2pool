@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,7 +19,7 @@
 
 #ifdef _MSC_VER
 #pragma warning(push)
-#pragma warning(disable : 4623 5026 5027)
+#pragma warning(disable : 4623 5026 5027 5262)
 #endif
 
 #define ROBIN_HOOD_MALLOC(size) p2pool::malloc_hook(size)
@@ -34,10 +34,21 @@
 
 namespace p2pool {
 
-#define P2POOL_VERSION_MAJOR 3
-#define P2POOL_VERSION_MINOR 5
+#define P2POOL_VERSION_MAJOR 4
+#define P2POOL_VERSION_MINOR 0
+#define P2POOL_VERSION_PATCH 0
+
+constexpr uint32_t P2POOL_VERSION = (P2POOL_VERSION_MAJOR << 16) | (P2POOL_VERSION_MINOR << 8) | P2POOL_VERSION_PATCH;
 
 extern const char* VERSION;
+
+enum class SoftwareID : uint32_t {
+	P2Pool = 0,
+	GoObserver = 0x624F6F47UL,
+	Unknown = 0xFFFFFFFFUL,
+};
+
+SoftwareID get_software_id(uint32_t value);
 
 template<typename T> struct not_implemented { enum { value = 0 }; };
 
@@ -51,27 +62,15 @@ struct nocopy_nomove
 };
 
 template<typename T>
-struct ScopeGuard
+struct ScopeGuard : public nocopy_nomove
 {
 	explicit FORCEINLINE ScopeGuard(T&& handler) : m_handler(std::move(handler)) {}
 	FORCEINLINE ~ScopeGuard() { m_handler(); }
 
 	T m_handler;
-
-	// Disable copying/moving of ScopeGuard objects
-
-	// We can't declare copy constructor as explicitly deleted because of copy elision semantics
-	// Just leave it without definition and it'll fail when linking if someone tries to copy a ScopeGuard object
-	ScopeGuard(const ScopeGuard&);
-
-private:
-	ScopeGuard& operator=(const ScopeGuard&) = delete;
-	ScopeGuard& operator=(ScopeGuard&&) = delete;
 };
 
-template<typename T> FORCEINLINE ScopeGuard<T> on_scope_leave(T&& handler) { return ScopeGuard<T>(std::move(handler)); }
-
-#define ON_SCOPE_LEAVE(...) auto CONCAT(scope_guard_, __LINE__) = on_scope_leave(__VA_ARGS__);
+#define ON_SCOPE_LEAVE(...) auto CONCAT(scope_guard_, __LINE__) = ScopeGuard{ __VA_ARGS__ };
 
 struct MinerCallbackHandler
 {
@@ -90,11 +89,56 @@ static FORCEINLINE bool from_hex(char c, T& out_value) {
 	return false;
 }
 
+static FORCEINLINE bool from_hex(const char* s, size_t len, hash& h) {
+	if (len != HASH_SIZE * 2) {
+		return false;
+	}
+
+	hash result;
+
+	for (uint32_t i = 0; i < HASH_SIZE; ++i) {
+		uint8_t d[2];
+		if (!from_hex(s[i * 2], d[0]) || !from_hex(s[i * 2 + 1], d[1])) {
+			return false;
+		}
+		result.h[i] = (d[0] << 4) | d[1];
+	}
+
+	h = result;
+	return true;
+}
+
+static FORCEINLINE bool from_hex(const char* s, size_t len, std::vector<uint8_t>& data) {
+	if (len % 2) {
+		return false;
+	}
+
+	len /= 2;
+	std::vector<uint8_t> result(len);
+
+	for (uint32_t i = 0; i < len; ++i) {
+		uint8_t d[2];
+		if (!from_hex(s[i * 2], d[0]) || !from_hex(s[i * 2 + 1], d[1])) {
+			return false;
+		}
+		result[i] = (d[0] << 4) | d[1];
+	}
+
+	data = std::move(result);
+	return true;
+}
+
+template<typename T, bool is_signed> struct is_negative_helper {};
+template<typename T> struct is_negative_helper<T, false> { static FORCEINLINE bool value(T) { return false; } };
+template<typename T> struct is_negative_helper<T, true>  { static FORCEINLINE bool value(T x) { return (x < 0); } };
+
+template<typename T> FORCEINLINE bool is_negative(T x) { return is_negative_helper<T, std::is_signed<T>::value>::value(x); }
+
 template<typename T, bool is_signed> struct abs_helper {};
 template<typename T> struct abs_helper<T, false> { static FORCEINLINE T value(T x) { return x; } };
-template<typename T> struct abs_helper<T, true>  { static FORCEINLINE T value(T x) { return (x >= 0) ? x : -x; } };
+template<typename T> struct abs_helper<T, true>  { static FORCEINLINE std::make_unsigned_t<T> value(T x) { return (x < 0) ? -x : x; } };
 
-template<typename T> FORCEINLINE T abs(T x) { return abs_helper<T, std::is_signed<T>::value>::value(x); }
+template<typename T> FORCEINLINE std::make_unsigned_t<T> abs(T x) { return abs_helper<T, std::is_signed<T>::value>::value(x); }
 
 template<typename T, typename U>
 FORCEINLINE void writeVarint(T value, U&& callback)
@@ -112,6 +156,9 @@ FORCEINLINE void writeVarint(T value, std::vector<uint8_t>& out)
 	writeVarint(value, [&out](uint8_t b) { out.emplace_back(b); });
 }
 
+template<typename T> static FORCEINLINE bool out_of_range(uint64_t value) { return value > std::numeric_limits<T>::max(); }
+template<> FORCEINLINE bool out_of_range<uint64_t>(uint64_t) { return false; }
+
 template<typename T>
 const uint8_t* readVarint(const uint8_t* data, const uint8_t* data_end, T& b)
 {
@@ -125,10 +172,18 @@ const uint8_t* readVarint(const uint8_t* data, const uint8_t* data_end, T& b)
 
 		const uint64_t cur_byte = *(data++);
 		result |= (cur_byte & 0x7F) << k;
+
+		if ((k > 0) && (shiftleft128(cur_byte & 0x7F, 0, k) != 0)) {
+			return nullptr;
+		}
+
 		k += 7;
 
 		if ((cur_byte & 0x80) == 0) {
-			b = result;
+			if (out_of_range<T>(result)) {
+				return nullptr;
+			}
+			b = static_cast<T>(result);
 			return data;
 		}
 	}
@@ -311,6 +366,7 @@ void memory_tracking_start();
 bool memory_tracking_stop();
 void p2pool_usage();
 void p2pool_version();
+int p2pool_test();
 
 namespace robin_hood {
 
@@ -318,6 +374,15 @@ template<>
 struct hash<p2pool::hash>
 {
 	FORCEINLINE size_t operator()(const p2pool::hash& value) const noexcept
+	{
+		return hash_bytes(value.h, p2pool::HASH_SIZE);
+	}
+};
+
+template<>
+struct hash<p2pool::root_hash>
+{
+	FORCEINLINE size_t operator()(const p2pool::root_hash& value) const noexcept
 	{
 		return hash_bytes(value.h, p2pool::HASH_SIZE);
 	}

@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -23,13 +23,15 @@ static thread_local const char* log_category_prefix = "TCPServer ";
 
 namespace p2pool {
 
-TCPServer::TCPServer(int default_backlog, allocate_client_callback allocate_new_client)
+TCPServer::TCPServer(int default_backlog, allocate_client_callback allocate_new_client, const std::string& socks5Proxy)
 	: m_allocateNewClient(allocate_new_client)
 	, m_defaultBacklog(default_backlog)
 	, m_loopThread{}
+	, m_loopThreadCreated(false)
 #ifdef WITH_UPNP
 	, m_portMapping(0)
 #endif
+	, m_socks5Proxy(socks5Proxy)
 	, m_socks5ProxyV6(false)
 	, m_socks5ProxyIP{}
 	, m_socks5ProxyPort(-1)
@@ -71,6 +73,18 @@ TCPServer::TCPServer(int default_backlog, allocate_client_callback allocate_new_
 	m_connectedClientsList = m_allocateNewClient();
 	m_connectedClientsList->m_next = m_connectedClientsList;
 	m_connectedClientsList->m_prev = m_connectedClientsList;
+
+	if (!m_socks5Proxy.empty()) {
+		parse_address_list(m_socks5Proxy,
+			[this](bool is_v6, const std::string& /*address*/, const std::string& ip, int port)
+			{
+				if (!str_to_ip(is_v6, ip.c_str(), m_socks5ProxyIP)) {
+					PANIC_STOP();
+				}
+				m_socks5ProxyV6 = is_v6;
+				m_socks5ProxyPort = port;
+			});
+	}
 }
 
 TCPServer::~TCPServer()
@@ -112,7 +126,7 @@ void TCPServer::parse_address_list_internal(const std::string& address_list, Cal
 				}
 			}
 
-			const int port = strtol(address.substr(k2 + 1).c_str(), nullptr, 10);
+			const uint32_t port = std::stoul(address.substr(k2 + 1), nullptr, 10);
 			if ((port > 0) && (port < 65536)) {
 				callback(is_v6, address, ip, port);
 			}
@@ -250,6 +264,8 @@ void TCPServer::start_listening(const std::string& listen_addresses, bool upnp)
 		LOGERR(1, "failed to start event loop thread, error " << uv_err_name(err));
 		PANIC_STOP();
 	}
+
+	m_loopThreadCreated = true;
 }
 
 bool TCPServer::connect_to_peer(bool is_v6, const char* ip, int port)
@@ -378,7 +394,7 @@ bool TCPServer::connect_to_peer(Client* client)
 		else {
 			sockaddr_in* addr4 = reinterpret_cast<sockaddr_in*>(&addr);
 			addr4->sin_family = AF_INET;
-			memcpy(&addr4->sin_addr, client->m_addr.data + 12, sizeof(in_addr));
+			memcpy(&addr4->sin_addr, client->m_addr.data + sizeof(raw_ip::ipv4_prefix), sizeof(in_addr));
 			addr4->sin_port = htons(static_cast<uint16_t>(client->m_port));
 		}
 	}
@@ -392,7 +408,7 @@ bool TCPServer::connect_to_peer(Client* client)
 		else {
 			sockaddr_in* addr4 = reinterpret_cast<sockaddr_in*>(&addr);
 			addr4->sin_family = AF_INET;
-			memcpy(&addr4->sin_addr, m_socks5ProxyIP.data + 12, sizeof(in_addr));
+			memcpy(&addr4->sin_addr, m_socks5ProxyIP.data + sizeof(raw_ip::ipv4_prefix), sizeof(in_addr));
 			addr4->sin_port = htons(static_cast<uint16_t>(m_socks5ProxyPort));
 		}
 	}
@@ -416,6 +432,7 @@ void TCPServer::check_event_loop_thread(const char* func) const
 {
 	if (server_event_loop_thread != this) {
 		LOGERR(1, func << " called from another thread, this is not thread safe");
+		PANIC_STOP();
 	}
 }
 #endif
@@ -473,7 +490,9 @@ void TCPServer::shutdown_tcp()
 	}
 #endif
 
-	uv_thread_join(&m_loopThread);
+	if (m_loopThreadCreated) {
+		uv_thread_join(&m_loopThread);
+	}
 
 	uv_mutex_destroy(&m_bansLock);
 
@@ -535,9 +554,9 @@ bool TCPServer::send_internal(Client* client, Callback<size_t, uint8_t*, size_t>
 		PANIC_STOP();
 	}
 
-	if (bytes_written == 0) {
-		LOGWARN(1, "send callback wrote 0 bytes, nothing to do");
-		return true;
+	if (!bytes_written) {
+		LOGWARN(1, "send callback failed");
+		return false;
 	}
 
 	WriteBuf* buf = get_write_buffer(bytes_written);
@@ -592,8 +611,7 @@ void TCPServer::loop(void* data)
 		Client* c = server->m_allocateNewClient();
 
 		ASAN_POISON_MEMORY_REGION(wb, sizeof(WriteBuf));
-		ASAN_POISON_MEMORY_REGION(c, c->size());
-		ASAN_UNPOISON_MEMORY_REGION(&c->m_resetCounter, sizeof(c->m_resetCounter));
+		c->asan_poison_this();
 
 		server->m_writeBuffers.emplace(capacity, wb);
 		server->m_preallocatedClients.emplace_back(c);
@@ -777,10 +795,8 @@ void TCPServer::on_new_client(uv_stream_t* server, Client* client)
 			client->m_port = ntohs(reinterpret_cast<sockaddr_in6*>(&peer_addr)->sin6_port);
 		}
 		else {
-			client->m_addr = {};
-			client->m_addr.data[10] = 0xFF;
-			client->m_addr.data[11] = 0xFF;
-			memcpy(client->m_addr.data + 12, &reinterpret_cast<sockaddr_in*>(&peer_addr)->sin_addr, sizeof(in_addr));
+			memcpy(client->m_addr.data, raw_ip::ipv4_prefix, sizeof(raw_ip::ipv4_prefix));
+			memcpy(client->m_addr.data + sizeof(raw_ip::ipv4_prefix), &reinterpret_cast<sockaddr_in*>(&peer_addr)->sin_addr, sizeof(in_addr));
 			client->m_port = ntohs(reinterpret_cast<sockaddr_in*>(&peer_addr)->sin_port);
 		}
 
@@ -857,7 +873,12 @@ void TCPServer::on_shutdown(uv_async_t* async)
 
 	uv_timer_init(&s->m_loop, &s->m_shutdownTimer);
 	s->m_shutdownTimer.data = s;
+
+#ifdef DEV_TEST_SYNC
+	s->m_shutdownCountdown = 300;
+#else
 	s->m_shutdownCountdown = 30;
+#endif
 
 	uv_timer_start(&s->m_shutdownTimer,
 		[](uv_timer_t* h)
@@ -957,8 +978,7 @@ TCPServer::Client* TCPServer::get_client()
 
 void TCPServer::return_client(Client* c)
 {
-	ASAN_POISON_MEMORY_REGION(c, c->size());
-	ASAN_UNPOISON_MEMORY_REGION(&c->m_resetCounter, sizeof(c->m_resetCounter));
+	c->asan_poison_this();
 	m_preallocatedClients.push_back(c);
 }
 
@@ -1100,7 +1120,7 @@ bool TCPServer::Client::on_proxy_handshake(char* data, uint32_t size)
 					}
 					else {
 						buf[3] = 1; // ATYP
-						memcpy(buf + 4, m_addr.data + 12, 4);
+						memcpy(buf + 4, m_addr.data + sizeof(raw_ip::ipv4_prefix), 4);
 						buf[8] = static_cast<uint8_t>(m_port >> 8);
 						buf[9] = static_cast<uint8_t>(m_port & 0xFF);
 					}
@@ -1205,8 +1225,9 @@ void TCPServer::Client::close()
 		// Already closed
 		return;
 	}
-
 	m_isClosing = true;
+
+	m_owner->check_event_loop_thread(__func__);
 
 	uv_read_stop(reinterpret_cast<uv_stream_t*>(&m_socket));
 
@@ -1238,7 +1259,7 @@ void TCPServer::Client::init_addr_string()
 		addr_str = inet_ntop(AF_INET6, m_addr.data, addr_str_buf, sizeof(addr_str_buf));
 	}
 	else {
-		addr_str = inet_ntop(AF_INET, m_addr.data + 12, addr_str_buf, sizeof(addr_str_buf));
+		addr_str = inet_ntop(AF_INET, m_addr.data + sizeof(raw_ip::ipv4_prefix), addr_str_buf, sizeof(addr_str_buf));
 	}
 
 	if (addr_str) {
@@ -1255,6 +1276,19 @@ void TCPServer::Client::init_addr_string()
 			s << log::const_buf(addr_str, n) << ':' << m_port << '\0';
 		}
 	}
+}
+
+void TCPServer::Client::asan_poison_this() const
+{
+#ifdef P2POOL_ASAN
+	const uint8_t* begin = reinterpret_cast<const uint8_t*>(this);
+	const uint8_t* counter_begin = reinterpret_cast<const uint8_t*>(&m_resetCounter);
+	const uint8_t* counter_end = counter_begin + sizeof(m_resetCounter);
+	const uint8_t* end = begin + size();
+
+	ASAN_POISON_MEMORY_REGION(begin, counter_begin - begin);
+	ASAN_POISON_MEMORY_REGION(counter_end, end - counter_end);
+#endif
 }
 
 } // namespace p2pool

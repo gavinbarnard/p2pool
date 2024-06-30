@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -34,8 +34,8 @@
 LOG_CATEGORY(P2PServer)
 
 static constexpr char saved_peer_list_file_name[] = "p2pool_peers.txt";
-static const char* seed_nodes[] = { "seeds.p2pool.io", ""};
-static const char* seed_nodes_mini[] = { "seeds-mini.p2pool.io", "" };
+static const char* seed_nodes[] = { "seeds.p2pool.io", "main.p2poolpeers.net", "main.gupax.io", "" };
+static const char* seed_nodes_mini[] = { "seeds-mini.p2pool.io", "mini.p2poolpeers.net", "mini.gupax.io", "" };
 
 static constexpr int DEFAULT_BACKLOG = 16;
 static constexpr uint64_t DEFAULT_BAN_TIME = 600;
@@ -44,7 +44,7 @@ static constexpr uint64_t PEER_REQUEST_DELAY = 60;
 namespace p2pool {
 
 P2PServer::P2PServer(p2pool* pool)
-	: TCPServer(DEFAULT_BACKLOG, P2PClient::allocate)
+	: TCPServer(DEFAULT_BACKLOG, P2PClient::allocate, pool->params().m_socks5Proxy)
 	, m_pool(pool)
 	, m_cache(pool->params().m_blockCache ? new BlockCache() : nullptr)
 	, m_cacheLoaded(false)
@@ -59,6 +59,7 @@ P2PServer::P2PServer(p2pool* pool)
 	, m_peerListLastSaved(0)
 	, m_lookForMissingBlocks(true)
 	, m_fastestPeer(nullptr)
+	, m_newP2PoolVersionDetected(false)
 {
 	m_callbackBuf.resize(P2P_BUF_SIZE);
 	m_blockDeserializeBuf.reserve(MAX_BLOCK_SIZE);
@@ -70,19 +71,6 @@ P2PServer::P2PServer(p2pool* pool)
 
 	const Params& params = pool->params();
 
-	if (!params.m_socks5Proxy.empty()) {
-		parse_address_list(params.m_socks5Proxy,
-			[this](bool is_v6, const std::string& /*address*/, const std::string& ip, int port)
-			{
-				if (!str_to_ip(is_v6, ip.c_str(), m_socks5ProxyIP)) {
-					PANIC_STOP();
-				}
-				m_socks5ProxyV6 = is_v6;
-				m_socks5ProxyPort = port;
-			});
-		m_socks5Proxy = params.m_socks5Proxy;
-	}
-
 	set_max_outgoing_peers(params.m_maxOutgoingPeers);
 	set_max_incoming_peers(params.m_maxIncomingPeers);
 
@@ -91,6 +79,7 @@ P2PServer::P2PServer(p2pool* pool)
 	uv_mutex_init_checked(&m_broadcastLock);
 	uv_rwlock_init_checked(&m_cachedBlocksLock);
 	uv_mutex_init_checked(&m_connectToPeersLock);
+	uv_mutex_init_checked(&m_showPeersLock);
 
 	int err = uv_async_init(&m_loop, &m_broadcastAsync, on_broadcast);
 	if (err) {
@@ -149,6 +138,7 @@ P2PServer::~P2PServer()
 	uv_rwlock_destroy(&m_cachedBlocksLock);
 
 	uv_mutex_destroy(&m_connectToPeersLock);
+	uv_mutex_destroy(&m_showPeersLock);
 
 	delete m_block;
 	delete m_cache;
@@ -188,7 +178,7 @@ void P2PServer::clear_cached_blocks()
 		return;
 	}
 
-	for (auto it : *m_cachedBlocks) {
+	for (const auto& it : *m_cachedBlocks) {
 		delete it.second;
 	}
 
@@ -205,13 +195,12 @@ void P2PServer::store_in_cache(const PoolBlock& block)
 
 void P2PServer::connect_to_peers_async(const char* peer_list)
 {
-	{
-		MutexLock lock(m_connectToPeersLock);
-		if (!m_connectToPeersData.empty()) {
-			m_connectToPeersData.append(1, ',');
-		}
-		m_connectToPeersData.append(peer_list);
+	MutexLock lock(m_connectToPeersLock);
+
+	if (!m_connectToPeersData.empty()) {
+		m_connectToPeersData.append(1, ',');
 	}
+	m_connectToPeersData.append(peer_list);
 
 	if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&m_connectToPeersAsync))) {
 		uv_async_send(&m_connectToPeersAsync);
@@ -239,7 +228,9 @@ void P2PServer::connect_to_peers(const std::string& peer_list)
 		[this](bool is_v6, const std::string& /*address*/, std::string ip, int port)
 		{
 			if (!m_pool->params().m_dns || resolve_host(ip, is_v6)) {
-				connect_to_peer(is_v6, ip.c_str(), port);
+				if (!connect_to_peer(is_v6, ip.c_str(), port)) {
+					LOGERR(5, "connect_to_peers: failed to connect to " << ip);
+				}
 			}
 		});
 }
@@ -268,6 +259,9 @@ void P2PServer::update_peer_connections()
 
 	bool has_good_peers = false;
 	m_fastestPeer = nullptr;
+
+	uint64_t total_outgoing_p2pool = 0;
+	uint64_t newer_version_p2pool = 0;
 
 	unordered_set<raw_ip> connected_clients;
 
@@ -302,8 +296,16 @@ void P2PServer::update_peer_connections()
 			if ((client->m_pingTime >= 0) && (!m_fastestPeer || (m_fastestPeer->m_pingTime > client->m_pingTime))) {
 				m_fastestPeer = client;
 			}
+			if ((client->m_SoftwareID == SoftwareID::P2Pool) && client->m_SoftwareVersion && !client->m_isIncoming) {
+				++total_outgoing_p2pool;
+				if (client->m_SoftwareVersion > P2POOL_VERSION) {
+					++newer_version_p2pool;
+				}
+			}
 		}
 	}
+
+	m_newP2PoolVersionDetected = newer_version_p2pool * 5 > total_outgoing_p2pool;
 
 	std::vector<Peer> peer_list;
 	{
@@ -351,7 +353,7 @@ void P2PServer::update_peer_connections()
 		peer_list.pop_back();
 	}
 
-	if (!has_good_peers && ((m_timerCounter % 10) == 0)) {
+	if (!has_good_peers && ((m_timerCounter % 10) == 0) && (SideChain::network_type() == NetworkType::Mainnet)) {
 		LOGERR(1, "no connections to other p2pool nodes, check your monerod/p2pool/network/firewall setup!!!");
 		load_peer_list();
 		if (m_peerListMonero.empty()) {
@@ -460,7 +462,7 @@ void P2PServer::save_peer_list()
 		}
 		else {
 			in_addr addr{};
-			memcpy(&addr.s_addr, p.m_addr.data + 12, sizeof(addr.s_addr));
+			memcpy(&addr.s_addr, p.m_addr.data + sizeof(raw_ip::ipv4_prefix), sizeof(addr.s_addr));
 			addr_str = inet_ntop(AF_INET, &addr, addr_str_buf, sizeof(addr_str_buf));
 			if (addr_str) {
 				f << addr_str << ':' << p.m_port << '\n';
@@ -594,10 +596,11 @@ void P2PServer::load_peer_list()
 				return;
 			}
 			p.m_isV6 = is_v6;
+			p.normalize();
 
 			bool already_added = false;
 			for (const Peer& peer : m_peerList) {
-				if ((peer.m_isV6 == p.m_isV6) && (peer.m_addr == p.m_addr)) {
+				if (peer.m_addr == p.m_addr) {
 					already_added = true;
 					break;
 				}
@@ -699,10 +702,13 @@ void P2PServer::update_peer_in_list(bool is_v6, const raw_ip& ip, int port)
 {
 	const uint64_t cur_time = seconds_since_epoch();
 
+	Peer peer{ is_v6, ip, port, 0, cur_time };
+	peer.normalize();
+
 	MutexLock lock(m_peerListLock);
 
 	for (Peer& p : m_peerList) {
-		if ((p.m_isV6 == is_v6) && (p.m_addr == ip)) {
+		if (p.m_addr == peer.m_addr) {
 			p.m_port = port;
 			p.m_numFailedConnections = 0;
 			p.m_lastSeen = cur_time;
@@ -710,8 +716,8 @@ void P2PServer::update_peer_in_list(bool is_v6, const raw_ip& ip, int port)
 		}
 	}
 
-	if (!is_banned(is_v6, ip)) {
-		m_peerList.emplace_back(Peer{ is_v6, ip, port, 0, cur_time });
+	if (!is_banned(peer.m_isV6, peer.m_addr)) {
+		m_peerList.push_back(peer);
 	}
 }
 
@@ -741,8 +747,24 @@ void P2PServer::remove_peer_from_list(const raw_ip& ip)
 	}
 }
 
+void P2PServer::Peer::normalize()
+{
+	if (m_isV6 && m_addr.is_ipv4_prefix()) {
+		m_isV6 = false;
+	}
+	else if (!m_isV6) {
+		// Fill in default bytes for IPv4 addresses
+		memcpy(m_addr.data, raw_ip::ipv4_prefix, sizeof(raw_ip::ipv4_prefix));
+	}
+}
+
 void P2PServer::broadcast(const PoolBlock& block, const PoolBlock* parent)
 {
+	// Don't broadcast blocks when shutting down
+	if (m_finished.load()) {
+		return;
+	}
+
 	MinerData miner_data = m_pool->miner_data();
 
 	if (block.m_txinGenHeight + 2 < miner_data.height) {
@@ -782,6 +804,10 @@ void P2PServer::broadcast(const PoolBlock& block, const PoolBlock* parent)
 
 	writeVarint(total_reward, data->pruned_blob);
 	writeVarint(outputs_blob_size, data->pruned_blob);
+
+	if (block.merge_mining_enabled()) {
+		data->pruned_blob.insert(data->pruned_blob.end(), block.m_sidechainId.h, block.m_sidechainId.h + HASH_SIZE);
+	}
 
 	data->pruned_blob.insert(data->pruned_blob.end(), mainchain_data.begin() + outputs_offset + outputs_blob_size, mainchain_data.end());
 
@@ -827,33 +853,21 @@ void P2PServer::broadcast(const PoolBlock& block, const PoolBlock* parent)
 
 	LOGINFO(5, "Broadcasting block " << block.m_sidechainId << " (height " << block.m_sidechainHeight << "): " << data->compact_blob.size() << '/' << data->pruned_blob.size() << '/' << data->blob.size() << " bytes (compact/pruned/full)");
 
-	{
-		MutexLock lock(m_broadcastLock);
-		m_broadcastQueue.push_back(data);
-	}
+	MutexLock lock(m_broadcastLock);
 
 	if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&m_broadcastAsync))) {
+		delete data;
 		return;
 	}
+
+	m_broadcastQueue.push_back(data);
 
 	const int err = uv_async_send(&m_broadcastAsync);
 	if (err) {
 		LOGERR(1, "uv_async_send failed, error " << uv_err_name(err));
 
-		bool found = false;
-		{
-			MutexLock lock(m_broadcastLock);
-
-			auto it = std::find(m_broadcastQueue.begin(), m_broadcastQueue.end(), data);
-			if (it != m_broadcastQueue.end()) {
-				found = true;
-				m_broadcastQueue.erase(it);
-			}
-		}
-
-		if (found) {
-			delete data;
-		}
+		m_broadcastQueue.pop_back();
+		delete data;
 	}
 }
 
@@ -872,6 +886,32 @@ void P2PServer::on_broadcast()
 
 	if (broadcast_queue.empty()) {
 		return;
+	}
+
+	if (pool_block_debug()) {
+		for (Broadcast* data : broadcast_queue) {
+			if (!data->compact_blob.empty()) {
+				PoolBlock check;
+				const int result = check.deserialize(data->compact_blob.data(), data->compact_blob.size(), m_pool->side_chain(), nullptr, true);
+				if (result != 0) {
+					LOGERR(1, "compact blob broadcast is broken, error " << result);
+				}
+			}
+			{
+				PoolBlock check;
+				const int result = check.deserialize(data->pruned_blob.data(), data->pruned_blob.size(), m_pool->side_chain(), nullptr, false);
+				if (result != 0) {
+					LOGERR(1, "pruned blob broadcast is broken, error " << result);
+				}
+			}
+			{
+				PoolBlock check;
+				const int result = check.deserialize(data->blob.data(), data->blob.size(), m_pool->side_chain(), nullptr, false);
+				if (result != 0) {
+					LOGERR(1, "full blob broadcast is broken, error " << result);
+				}
+			}
+		}
 	}
 
 	for (P2PClient* client = static_cast<P2PClient*>(m_connectedClientsList->m_next); client != m_connectedClientsList; client = static_cast<P2PClient*>(client->m_next)) {
@@ -988,6 +1028,8 @@ void P2PServer::print_status()
 
 void P2PServer::show_peers_async()
 {
+	MutexLock lock(m_showPeersLock);
+
 	if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&m_showPeersAsync))) {
 		uv_async_send(&m_showPeersAsync);
 	}
@@ -1005,7 +1047,7 @@ void P2PServer::show_peers() const
 			char buf[32] = {};
 			if (client->m_SoftwareVersion) {
 				log::Stream s(buf);
-				s << client->software_name() << " v" << (client->m_SoftwareVersion >> 16) << '.' << (client->m_SoftwareVersion & 0xFFFF);
+				s << P2PClient::SoftwareDisplayName(client->m_SoftwareID, client->m_SoftwareVersion);
 			}
 			LOGINFO(0, (client->m_isIncoming ? "I\t" : "O\t")
 				<< log::pad_right(log::Duration(cur_time - client->m_connectedTime), 16) << '\t'
@@ -1075,6 +1117,7 @@ void P2PServer::on_timer()
 	update_peer_connections();
 	check_host();
 	check_block_template();
+	check_for_updates();
 	api_update_local_stats();
 }
 
@@ -1168,7 +1211,9 @@ void P2PServer::download_missing_blocks()
 			auto it = m_cachedBlocks->find(id);
 			if (it != m_cachedBlocks->end()) {
 				LOGINFO(5, "using cached block for id = " << id);
-				client->handle_incoming_block_async(it->second);
+				if (!client->handle_incoming_block_async(it->second)) {
+					LOGERR(5, "download_missing_blocks: handle_incoming_block_async failed");
+				}
 				continue;
 			}
 		}
@@ -1218,7 +1263,7 @@ void P2PServer::check_host()
 	for (const PoolBlock* b = side_chain.chainTip(); b && (b->m_txinGenHeight >= height + 2); b = side_chain.find_block(b->m_parent)) {
 		if (--counter == 0) {
 			const Params::Host& host = m_pool->current_host();
-			LOGERR(1, host.m_displayName << " seems to be stuck, reconnecting");
+			LOGERR(1, "Host " << host.m_displayName << " seems to be stuck, reconnecting");
 			m_pool->reconnect_to_host();
 			return;
 		}
@@ -1231,7 +1276,7 @@ void P2PServer::check_host()
 	if (cur_time >= last_active + 300) {
 		const uint64_t dt = static_cast<uint64_t>(cur_time - last_active);
 		const Params::Host& host = m_pool->current_host();
-		LOGERR(1, "no ZMQ messages received from " << host.m_displayName << " in the last " << dt << " seconds, check your monerod/p2pool/network/firewall setup!!!");
+		LOGERR(1, "no ZMQ messages received from host " << host.m_displayName << " in the last " << dt << " seconds, check your monerod/p2pool/network/firewall setup!!!");
 		m_pool->reconnect_to_host();
 	}
 }
@@ -1246,6 +1291,27 @@ void P2PServer::check_block_template()
 	if (seconds_since_epoch() >= m_pool->block_template().last_updated() + 20) {
 		LOGINFO(4, "block template is 20 seconds old, updating it");
 		m_pool->update_block_template_async();
+	}
+}
+
+void P2PServer::check_for_updates(bool forced) const
+{
+#ifdef DEV_TEST_SYNC
+	constexpr uint64_t check_interval = 60;
+#else
+	constexpr uint64_t check_interval = 3600;
+#endif
+
+	if (!forced && (m_timerCounter % (check_interval / m_timerInterval) != 0)) {
+		return;
+	}
+
+	const SideChain& s = m_pool->side_chain();
+
+	if ((forced || s.precalcFinished()) && m_newP2PoolVersionDetected && s.p2pool_update_available()) {
+		LOGINFO(0, log::LightCyan() << "********************************************************************************");
+		LOGINFO(0, log::LightCyan() << "* An updated P2Pool version is available, visit p2pool.io for more information *");
+		LOGINFO(0, log::LightCyan() << "********************************************************************************");
 	}
 }
 
@@ -1266,7 +1332,7 @@ P2PServer::P2PClient::P2PClient()
 	, m_peerListPendingRequests(0)
 	, m_protocolVersion(PROTOCOL_VERSION_1_0)
 	, m_SoftwareVersion(0)
-	, m_SoftwareID(0)
+	, m_SoftwareID(SoftwareID::P2Pool)
 	, m_pingTime(-1)
 	, m_lastAlive(0)
 	, m_lastBroadcastTimestamp(0)
@@ -1283,14 +1349,23 @@ void P2PServer::on_shutdown()
 
 	uv_timer_stop(&m_timer);
 	uv_close(reinterpret_cast<uv_handle_t*>(&m_timer), nullptr);
-	uv_close(reinterpret_cast<uv_handle_t*>(&m_broadcastAsync), nullptr);
-	uv_close(reinterpret_cast<uv_handle_t*>(&m_connectToPeersAsync), nullptr);
-	uv_close(reinterpret_cast<uv_handle_t*>(&m_showPeersAsync), nullptr);
+	{
+		MutexLock lock(m_broadcastLock);
+		uv_close(reinterpret_cast<uv_handle_t*>(&m_broadcastAsync), nullptr);
+	}
+	{
+		MutexLock lock(m_connectToPeersLock);
+		uv_close(reinterpret_cast<uv_handle_t*>(&m_connectToPeersAsync), nullptr);
+	}
+	{
+		MutexLock lock(m_showPeersLock);
+		uv_close(reinterpret_cast<uv_handle_t*>(&m_showPeersAsync), nullptr);
+	}
 }
 
 void P2PServer::api_update_local_stats()
 {
-	if (!m_pool->api() || !m_pool->params().m_localStats || ((m_timerCounter % 30) != 5)) {
+	if (!m_pool->api() || !m_pool->params().m_localStats || m_pool->stopped() || ((m_timerCounter % 30) != 5)) {
 		return;
 	}
 
@@ -1299,9 +1374,15 @@ void P2PServer::api_update_local_stats()
 		{
 			const uint64_t cur_time = seconds_since_epoch();
 
+			size_t peer_list_size;
+			{
+				MutexLock lock(m_peerListLock);
+				peer_list_size = m_peerList.size();
+			}
+
 			s << "{\"connections\":" << m_numConnections.load()
 				<< ",\"incoming_connections\":" << m_numIncomingConnections.load()
-				<< ",\"peer_list_size\":" << m_peerList.size()
+				<< ",\"peer_list_size\":" << peer_list_size
 				<< ",\"peers\":[";
 
 			bool first = true;
@@ -1311,7 +1392,7 @@ void P2PServer::api_update_local_stats()
 					char buf[32] = {};
 					log::Stream s1(buf);
 					if (client->m_SoftwareVersion) {
-						s1 << client->software_name() << " v" << (client->m_SoftwareVersion >> 16) << '.' << (client->m_SoftwareVersion & 0xFFFF);
+						s1 << P2PClient::SoftwareDisplayName(client->m_SoftwareID, client->m_SoftwareVersion);
 					}
 
 					if (!first) {
@@ -1326,10 +1407,6 @@ void P2PServer::api_update_local_stats()
 						<< client->m_broadcastMaxHeight << ','
 						<< static_cast<char*>(client->m_addrString)
 						<< '"';
-
-					if (s.m_pos + 128 >= s.m_bufSize) {
-						break;
-					}
 
 					first = false;
 				}
@@ -1368,7 +1445,7 @@ void P2PServer::P2PClient::reset()
 	m_peerListPendingRequests = 0;
 	m_protocolVersion = PROTOCOL_VERSION_1_0;
 	m_SoftwareVersion = 0;
-	m_SoftwareID = 0;
+	m_SoftwareID = SoftwareID::P2Pool;
 	m_pingTime = -1;
 	m_blockPendingRequests.clear();
 	m_lastAlive = 0;
@@ -1383,7 +1460,7 @@ void P2PServer::P2PClient::reset()
 
 bool P2PServer::P2PClient::on_connect()
 {
-	P2PServer* server = static_cast<P2PServer*>(m_owner);
+	const P2PServer* server = static_cast<P2PServer*>(m_owner);
 
 	if (!server) {
 		return false;
@@ -1890,7 +1967,7 @@ bool P2PServer::P2PClient::check_handshake_solution(const hash& solution, const 
 
 bool P2PServer::P2PClient::on_handshake_challenge(const uint8_t* buf)
 {
-	P2PServer* server = static_cast<P2PServer*>(m_owner);
+	const P2PServer* server = static_cast<P2PServer*>(m_owner);
 	server->check_event_loop_thread(__func__);
 
 	uint8_t challenge[CHALLENGE_SIZE];
@@ -2242,13 +2319,14 @@ bool P2PServer::P2PClient::on_peer_list_request(const uint8_t*)
 	// - use first 8 bytes of the 16-byte raw IP address to send supported protocol version and p2pool version
 	if (first) {
 		LOGINFO(5, "sending protocol version " << (SUPPORTED_PROTOCOL_VERSION >> 16) << '.' << (SUPPORTED_PROTOCOL_VERSION & 0xFFFF)
-			<< ", P2Pool version " << P2POOL_VERSION_MAJOR << '.' << P2POOL_VERSION_MINOR
+			<< ", P2Pool version " << P2POOL_VERSION_MAJOR << '.' << P2POOL_VERSION_MINOR << '.' << P2POOL_VERSION_PATCH
 			<< " to peer " << log::Gray() << static_cast<char*>(m_addrString));
 
 		peers[0] = {};
 		*reinterpret_cast<uint32_t*>(peers[0].m_addr.data) = SUPPORTED_PROTOCOL_VERSION;
-		*reinterpret_cast<uint32_t*>(peers[0].m_addr.data + 4) = (P2POOL_VERSION_MAJOR << 16) | P2POOL_VERSION_MINOR;
-		*reinterpret_cast<uint32_t*>(peers[0].m_addr.data + 12) = 0xFFFFFFFFU;
+		*reinterpret_cast<uint32_t*>(peers[0].m_addr.data + 4) = P2POOL_VERSION;
+		*reinterpret_cast<uint32_t*>(peers[0].m_addr.data + 8) = static_cast<uint32_t>(SoftwareID::P2Pool);
+		*reinterpret_cast<uint32_t*>(peers[0].m_addr.data + sizeof(raw_ip::ipv4_prefix)) = 0xFFFFFFFFU;
 		peers[0].m_port = 0xFFFF;
 
 		if (num_selected_peers == 0) {
@@ -2317,7 +2395,7 @@ void P2PServer::P2PClient::on_peer_list_response(const uint8_t* buf)
 				// Ignore 0.0.0.0/8 (special-purpose range for "this network") and 224.0.0.0/3 (IP multicast and reserved ranges)
 
 				// Check for protocol version message
-				if ((*reinterpret_cast<uint32_t*>(ip.data + 12) == 0xFFFFFFFFU) && (port == 0xFFFF)) {
+				if ((*reinterpret_cast<uint32_t*>(ip.data + sizeof(raw_ip::ipv4_prefix)) == 0xFFFFFFFFU) && (port == 0xFFFF)) {
 					const uint32_t version = *reinterpret_cast<uint32_t*>(ip.data);
 
 					// Clients with different major protocol versions communicate using v1.0 protocol
@@ -2330,24 +2408,30 @@ void P2PServer::P2PClient::on_peer_list_response(const uint8_t* buf)
 					}
 
 					m_SoftwareVersion = *reinterpret_cast<uint32_t*>(ip.data + 4);
-					m_SoftwareID = *reinterpret_cast<uint32_t*>(ip.data + 8);
+					const uint32_t id_value = *reinterpret_cast<uint32_t*>(ip.data + 8);
+					m_SoftwareID = get_software_id(id_value);
+
 					LOGINFO(5, "peer " << log::Gray() << static_cast<char*>(m_addrString) << log::NoColor()
 						<< " supports protocol version " << (m_protocolVersion >> 16) << '.' << (m_protocolVersion & 0xFFFF)
-						<< ", runs " << software_name() << " v" << (m_SoftwareVersion >> 16) << '.' << (m_SoftwareVersion & 0xFFFF)
+						<< ", runs " << P2PClient::SoftwareDisplayName(m_SoftwareID, m_SoftwareVersion)
 					);
+
+					if (m_SoftwareID == SoftwareID::Unknown) {
+						LOGWARN(4, "peer " << log::Gray() << static_cast<char*>(m_addrString) << log::NoColor()
+							<< "runs an unknown software with id = " << log::Hex(id_value)
+						);
+					}
 				}
 				continue;
 			}
 
 			// Fill in default bytes for IPv4 addresses
-			memset(ip.data, 0, 10);
-			ip.data[10] = 0xFF;
-			ip.data[11] = 0xFF;
+			memcpy(ip.data, raw_ip::ipv4_prefix, sizeof(raw_ip::ipv4_prefix));
 		}
 
 		bool already_added = false;
 		for (Peer& p : server->m_peerList) {
-			if ((p.m_isV6 == is_v6) && (p.m_addr == ip)) {
+			if (p.m_addr == ip) {
 				already_added = true;
 				p.m_lastSeen = cur_time;
 				break;
@@ -2355,7 +2439,9 @@ void P2PServer::P2PClient::on_peer_list_response(const uint8_t* buf)
 		}
 
 		if (!already_added && !server->is_banned(is_v6, ip)) {
-			server->m_peerList.emplace_back(Peer{ is_v6, ip, port, 0, cur_time });
+			Peer p{ is_v6, ip, port, 0, cur_time };
+			p.normalize();
+			server->m_peerList.push_back(p);
 		}
 	}
 }
@@ -2366,11 +2452,16 @@ void P2PServer::P2PClient::on_block_notify(const uint8_t* buf)
 	memcpy(id.h, buf, HASH_SIZE);
 
 	m_broadcastedHashes[m_broadcastedHashesIndex++ % array_size(&P2PClient::m_broadcastedHashes)] = id;
+	m_lastBroadcastTimestamp = seconds_since_epoch();
 
 	P2PServer* server = static_cast<P2PServer*>(m_owner);
 
 	// If we don't know about this block, request it from this peer. The peer can do it to speed up our initial sync, for example.
-	if (!server->find_block(id)) {
+	const PoolBlock* block = server->find_block(id);
+	if (block) {
+		m_broadcastMaxHeight = std::max(m_broadcastMaxHeight, block->m_sidechainHeight);
+	}
+	else {
 		LOGINFO(6, "Received an unknown block " << id << " in BLOCK_NOTIFY");
 
 		if (m_blockPendingRequests.size() >= 25) {
@@ -2474,9 +2565,10 @@ bool P2PServer::P2PClient::handle_incoming_block_async(const PoolBlock* block, u
 		bool client_isV6;
 		raw_ip client_ip;
 		std::vector<hash> missing_blocks;
+		bool result;
 	};
 
-	Work* work = new Work{ {}, *block, this, server, m_resetCounter.load(), m_isV6, m_addr, {} };
+	Work* work = new Work{ {}, *block, this, server, m_resetCounter.load(), m_isV6, m_addr, {}, true };
 	work->req.data = work;
 
 	const int err = uv_queue_work(&server->m_loop, &work->req,
@@ -2484,12 +2576,12 @@ bool P2PServer::P2PClient::handle_incoming_block_async(const PoolBlock* block, u
 		{
 			BACKGROUND_JOB_START(P2PServer::handle_incoming_block_async);
 			Work* work = reinterpret_cast<Work*>(req->data);
-			work->client->handle_incoming_block(work->server->m_pool, work->block, work->client_reset_counter, work->client_isV6, work->client_ip, work->missing_blocks);
+			work->client->handle_incoming_block(work->server->m_pool, work->block, work->missing_blocks, work->result);
 		},
 		[](uv_work_t* req, int /*status*/)
 		{
 			Work* work = reinterpret_cast<Work*>(req->data);
-			work->client->post_handle_incoming_block(work->block, work->client_reset_counter, work->missing_blocks);
+			work->client->post_handle_incoming_block(work->server->m_pool, work->block, work->client_reset_counter, work->client_isV6, work->client_ip, work->missing_blocks, work->result);
 			delete work;
 			BACKGROUND_JOB_STOP(P2PServer::handle_incoming_block_async);
 		});
@@ -2503,11 +2595,18 @@ bool P2PServer::P2PClient::handle_incoming_block_async(const PoolBlock* block, u
 	return true;
 }
 
-void P2PServer::P2PClient::handle_incoming_block(p2pool* pool, PoolBlock& block, const uint32_t reset_counter, bool is_v6, const raw_ip& addr, std::vector<hash>& missing_blocks)
+void P2PServer::P2PClient::handle_incoming_block(p2pool* pool, PoolBlock& block, std::vector<hash>& missing_blocks, bool& result)
 {
-	if (!pool->side_chain().add_external_block(block, missing_blocks)) {
+	result = pool->side_chain().add_external_block(block, missing_blocks);
+}
+
+void P2PServer::P2PClient::post_handle_incoming_block(p2pool* pool, const PoolBlock& block, const uint32_t reset_counter, bool is_v6, const raw_ip& addr, std::vector<hash>& missing_blocks, const bool result)
+{
+	const uint32_t new_reset_counter = m_resetCounter.load();
+
+	if (!result) {
 		// Client sent bad data, disconnect and ban it
-		if (reset_counter == m_resetCounter.load()) {
+		if (reset_counter == new_reset_counter) {
 			close();
 			LOGWARN(3, "peer " << static_cast<char*>(m_addrString) << " banned for " << DEFAULT_BAN_TIME << " seconds");
 		}
@@ -2519,13 +2618,10 @@ void P2PServer::P2PClient::handle_incoming_block(p2pool* pool, PoolBlock& block,
 		server->ban(is_v6, addr, DEFAULT_BAN_TIME);
 		server->remove_peer_from_list(addr);
 	}
-}
 
-void P2PServer::P2PClient::post_handle_incoming_block(const PoolBlock& block, const uint32_t reset_counter, std::vector<hash>& missing_blocks)
-{
 	// We might have been disconnected while side_chain was adding the block
 	// In this case we can't send BLOCK_REQUEST messages on this connection anymore
-	if (reset_counter != m_resetCounter.load()) {
+	if (reset_counter != new_reset_counter) {
 		return;
 	}
 
@@ -2540,7 +2636,7 @@ void P2PServer::P2PClient::post_handle_incoming_block(const PoolBlock& block, co
 		P2PClient* c = server->m_fastestPeer;
 		if (c && (c != this) && (c->m_broadcastMaxHeight >= block.m_sidechainHeight)) {
 			LOGINFO(5, "peer " << static_cast<char*>(c->m_addrString) << " is faster, sending BLOCK_REQUEST to it instead");
-			c->post_handle_incoming_block(block, c->m_resetCounter.load(), missing_blocks);
+			c->post_handle_incoming_block(pool, block, c->m_resetCounter.load(), c->m_isV6, c->m_addr, missing_blocks, true);
 			return;
 		}
 	}
@@ -2552,7 +2648,9 @@ void P2PServer::P2PClient::post_handle_incoming_block(const PoolBlock& block, co
 			auto it = server->m_cachedBlocks->find(id);
 			if (it != server->m_cachedBlocks->end()) {
 				LOGINFO(5, "using cached block for id = " << id);
-				handle_incoming_block_async(it->second);
+				if (!handle_incoming_block_async(it->second)) {
+					LOGERR(5, "post_handle_incoming_block: handle_incoming_block_async failed");
+				}
 				continue;
 			}
 		}
@@ -2561,7 +2659,7 @@ void P2PServer::P2PClient::post_handle_incoming_block(const PoolBlock& block, co
 			continue;
 		}
 
-		const bool result = server->send(this,
+		const bool send_result = server->send(this,
 			[this, &id](uint8_t* buf, size_t buf_size) -> size_t
 			{
 				LOGINFO(5, "[post_handle_incoming_block] sending BLOCK_REQUEST for id = " << id << " to " << static_cast<char*>(m_addrString));
@@ -2580,7 +2678,7 @@ void P2PServer::P2PClient::post_handle_incoming_block(const PoolBlock& block, co
 				return p - buf;
 			});
 
-		if (!result) {
+		if (!send_result) {
 			return;
 		}
 
@@ -2588,16 +2686,39 @@ void P2PServer::P2PClient::post_handle_incoming_block(const PoolBlock& block, co
 	}
 }
 
-const char* P2PServer::P2PClient::software_name() const
+template<> struct log::Stream::Entry<P2PServer::P2PClient::SoftwareDisplayName>
 {
-	switch (m_SoftwareID) {
-	case 0:
-		return "P2Pool";
-	case 0x624F6F47UL:
-		return "GoObserver";
-	default:
-		return "Unknown";
+	static NOINLINE void put(P2PServer::P2PClient::SoftwareDisplayName value, Stream* wrapper)
+	{
+		switch (value.m_id) {
+		case SoftwareID::P2Pool:
+		case SoftwareID::GoObserver:
+			if (value.m_id == SoftwareID::P2Pool) {
+				*wrapper << "P2Pool v";
+			}
+			else {
+				*wrapper << "GoObserver v";
+			}
+
+			if (value.m_version <= 0x3000A) {
+				// Encoding for versions <= 3.10
+				*wrapper << (value.m_version >> 16) << '.' << (value.m_version & 0xFFFF);
+			}
+			else {
+				// Encoding for versions > 3.10
+				*wrapper << (value.m_version >> 16) << '.' << ((value.m_version >> 8) & 0xFF);
+				if (value.m_version & 0xFF) {
+					*wrapper << '.' << (value.m_version & 0xFF);
+				}
+			}
+
+			break;
+
+		default:
+			*wrapper << "Unknown v" << (value.m_version >> 16) << '.' << (value.m_version & 0xFFFF);
+			break;
+		}
 	}
-}
+};
 
 } // namespace p2pool

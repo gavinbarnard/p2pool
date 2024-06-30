@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -37,7 +37,9 @@ class RandomBytes
 public:
 	RandomBytes() : rng(RandomDeviceSeed::instance), dist(0, 255)
 	{
-		uv_mutex_init_checked(&m);
+		if (uv_mutex_init(&m) != 0) {
+			abort();
+		}
 
 		// Diffuse the initial state in case it has low quality
 		rng.discard(10000);
@@ -93,6 +95,7 @@ void generate_keys(hash& pub, hash& sec)
 	ge_p3_tobytes(pub.h, &point);
 }
 
+// cppcheck-suppress constParameterReference
 void generate_keys_deterministic(hash& pub, hash& sec, const uint8_t* entropy, size_t len)
 {
 	uint32_t counter = 0;
@@ -218,8 +221,8 @@ public:
 		{
 			WriteLock lock(derivations_lock);
 
-			DerivationEntry& entry = derivations->emplace(index, DerivationEntry{ derivation, { 0xFFFFFFFFUL, 0xFFFFFFFFUL }, {}, t }).first->second;
-			entry.add_view_tag(static_cast<uint32_t>(output_index << 8) | view_tag);
+			auto entry = derivations->emplace(index, DerivationEntry{ derivation, { 0xFFFFFFFFUL, 0xFFFFFFFFUL }, {}, t }).first;
+			entry->second.add_view_tag(static_cast<uint32_t>(output_index << 8) | view_tag);
 		}
 
 		return true;

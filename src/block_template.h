@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -42,13 +42,16 @@ public:
 	void update(const MinerData& data, const Mempool& mempool, const Wallet* miner_wallet);
 	uint64_t last_updated() const { return m_lastUpdated.load(); }
 
-	bool get_difficulties(const uint32_t template_id, uint64_t& height, uint64_t& sidechain_height, difficulty_type& mainchain_difficulty, difficulty_type& sidechain_difficulty) const;
-	uint32_t get_hashing_blob(const uint32_t template_id, uint32_t extra_nonce, uint8_t (&blob)[128], uint64_t& height, difficulty_type& difficulty, difficulty_type& sidechain_difficulty, hash& seed_hash, size_t& nonce_offset) const;
+	bool get_difficulties(const uint32_t template_id, uint64_t& height, uint64_t& sidechain_height, difficulty_type& mainchain_difficulty, difficulty_type& aux_diff, difficulty_type& sidechain_difficulty) const;
+	uint32_t get_hashing_blob(const uint32_t template_id, uint32_t extra_nonce, uint8_t (&blob)[128], uint64_t& height, difficulty_type& difficulty, difficulty_type& aux_diff, difficulty_type& sidechain_difficulty, hash& seed_hash, size_t& nonce_offset) const;
 
-	uint32_t get_hashing_blob(uint32_t extra_nonce, uint8_t (&blob)[128], uint64_t& height, uint64_t& sidechain_height, difficulty_type& difficulty, difficulty_type& sidechain_difficulty, hash& seed_hash, size_t& nonce_offset, uint32_t& template_id) const;
-	uint32_t get_hashing_blobs(uint32_t extra_nonce_start, uint32_t count, std::vector<uint8_t>& blobs, uint64_t& height, difficulty_type& difficulty, difficulty_type& sidechain_difficulty, hash& seed_hash, size_t& nonce_offset, uint32_t& template_id) const;
+	uint32_t get_hashing_blob(uint32_t extra_nonce, uint8_t (&blob)[128], uint64_t& height, uint64_t& sidechain_height, difficulty_type& difficulty, difficulty_type& aux_diff, difficulty_type& sidechain_difficulty, hash& seed_hash, size_t& nonce_offset, uint32_t& template_id) const;
+	uint32_t get_hashing_blobs(uint32_t extra_nonce_start, uint32_t count, std::vector<uint8_t>& blobs, uint64_t& height, difficulty_type& difficulty, difficulty_type& aux_diff, difficulty_type& sidechain_difficulty, hash& seed_hash, size_t& nonce_offset, uint32_t& template_id) const;
 
-	std::vector<uint8_t> get_block_template_blob(uint32_t template_id, uint32_t sidechain_extra_nonce, size_t& nonce_offset, size_t& extra_nonce_offset, size_t& sidechain_id_offset, hash& sidechain_id) const;
+	std::vector<AuxChainData> get_aux_chains(const uint32_t template_id) const;
+	bool get_aux_proof(const uint32_t template_id, uint32_t extra_nonce, const hash& h, std::vector<hash>& proof, uint32_t& path) const;
+
+	std::vector<uint8_t> get_block_template_blob(uint32_t template_id, uint32_t sidechain_extra_nonce, size_t& nonce_offset, size_t& extra_nonce_offset, size_t& merkle_root_offset, hash& merge_mining_root, const BlockTemplate** pThis) const;
 
 	FORCEINLINE uint64_t height() const { return m_height; }
 	FORCEINLINE difficulty_type difficulty() const { return m_difficulty; }
@@ -57,6 +60,8 @@ public:
 
 	FORCEINLINE const std::vector<MinerShare>& shares() const { return m_shares; }
 	FORCEINLINE uint64_t get_reward() const { return m_finalReward; }
+
+	FORCEINLINE std::vector<uint8_t> get_coinbase_merkle_proof() const { ReadLock lock(m_lock); return m_merkleTreeMainBranch; }
 
 #ifdef P2POOL_UNIT_TESTS
 	FORCEINLINE const PoolBlock* pool_block_template() const { return m_poolBlockTemplate; }
@@ -68,6 +73,7 @@ private:
 	RandomX_Hasher_Base* m_hasher;
 
 private:
+	void select_mempool_transactions(const Mempool& mempool);
 	int create_miner_tx(const MinerData& data, const std::vector<MinerShare>& shares, uint64_t max_reward_amounts_weight, bool dry_run);
 	hash calc_sidechain_hash(uint32_t sidechain_extra_nonce) const;
 	hash calc_miner_tx_hash(uint32_t extra_nonce) const;
@@ -94,6 +100,7 @@ private:
 	hash m_prevId;
 	std::atomic<uint64_t> m_height;
 	difficulty_type m_difficulty;
+	difficulty_type m_auxDifficulty;
 	hash m_seedHash;
 
 	uint64_t m_timestamp;
@@ -106,11 +113,11 @@ private:
 
 	// Temp vectors, will be cleaned up after use and skipped in copy constructor/assignment operators
 	std::vector<uint8_t> m_minerTx;
-	uint64_t m_minerTxKeccakState[25];
+	std::array<uint64_t, 25> m_minerTxKeccakState;
 	size_t m_minerTxKeccakStateInputLength;
 
 	std::vector<uint8_t> m_sidechainHashBlob;
-	uint64_t m_sidechainHashKeccakState[25];
+	std::array<uint64_t, 25> m_sidechainHashKeccakState;
 	size_t m_sidechainHashInputLength;
 
 	std::vector<uint8_t> m_blockHeader;
@@ -132,6 +139,8 @@ private:
 
 	std::vector<uint32_t> m_knapsack;
 #endif
+
+	void init_merge_mining_merkle_proof();
 };
 
 } // namespace p2pool

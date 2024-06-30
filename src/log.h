@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -38,9 +38,18 @@ struct Stream
 	enum params : int { BUF_SIZE = 1024 - 1 };
 
 	template<size_t N>
-	explicit FORCEINLINE Stream(char (&buf)[N]) : m_pos(0), m_numberWidth(1), m_buf(buf), m_bufSize(N - 1) {}
+	explicit FORCEINLINE Stream(char (&buf)[N]) : m_pos(0), m_numberWidth(1), m_buf(buf), m_bufSize(N - 1), m_spilled(0) {}
 
-	FORCEINLINE Stream(void* buf, size_t size) : m_pos(0), m_numberWidth(1), m_buf(reinterpret_cast<char*>(buf)), m_bufSize(static_cast<int>(size) - 1) {}
+	FORCEINLINE Stream(void* buf, size_t size) { reset(buf, size); }
+
+	FORCEINLINE void reset(void* buf, size_t size)
+	{
+		m_pos = 0;
+		m_numberWidth = 1;
+		m_buf = reinterpret_cast<char*>(buf);
+		m_bufSize = static_cast<int>(size) - 1;
+		m_spilled = 0;
+	}
 
 	template<typename T>
 	struct Entry
@@ -70,15 +79,12 @@ struct Stream
 	{
 		static_assert(1 < base && base <= 64, "Invalid base");
 
-		const T data_with_sign = data;
-		data = abs(data);
-		const bool negative = (data != data_with_sign);
+		const bool negative = is_negative(data);
+		std::make_unsigned_t<T> udata = abs(data);
 
 		char buf[32];
 		size_t k = sizeof(buf);
 		int w = m_numberWidth;
-
-		std::make_unsigned_t<T> udata = static_cast<std::make_unsigned_t<T>>(data);
 
 		do {
 			buf[--k] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"[udata % base];
@@ -98,6 +104,7 @@ struct Stream
 		const int n = static_cast<int>(n0);
 		const int pos = m_pos;
 		if (pos + n > m_bufSize) {
+			m_spilled += n;
 			return;
 		}
 		memcpy(m_buf + pos, buf, n);
@@ -111,6 +118,7 @@ struct Stream
 	int m_numberWidth;
 	char* m_buf;
 	int m_bufSize;
+	int m_spilled;
 };
 
 struct Writer : public Stream
@@ -241,6 +249,7 @@ template<> struct Stream::Entry<hash>
 			buf[i * 2 + 0] = "0123456789abcdef"[data.h[i] >> 4];
 			buf[i * 2 + 1] = "0123456789abcdef"[data.h[i] & 15];
 		}
+		// cppcheck-suppress uninitvar
 		wrapper->writeBuf(buf, sizeof(buf));
 	}
 };
@@ -450,6 +459,7 @@ struct log::Stream::Entry<PadRight<T>>
 	static NOINLINE void put(PadRight<T>&& data, Stream* wrapper)
 	{
 		char buf[log::Stream::BUF_SIZE + 1];
+		// cppcheck-suppress uninitvar
 		log::Stream s(buf);
 		s << data.m_value;
 

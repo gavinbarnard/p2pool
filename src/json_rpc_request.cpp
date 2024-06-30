@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -175,6 +175,8 @@ CurlContext::CurlContext(const std::string& address, int port, const std::string
 			throw std::runtime_error(msg); \
 		} \
 	} while (0)
+
+	curl_easy_setopt_checked(m_handle, CURLOPT_BUFFERSIZE, 102400L);
 
 	curl_easy_setopt_checked(m_handle, CURLOPT_WRITEFUNCTION, write_func);
 	curl_easy_setopt_checked(m_handle, CURLOPT_WRITEDATA, this);
@@ -497,7 +499,9 @@ void Call(const std::string& address, int port, const std::string& req, const st
 		});
 
 	if (!result) {
-		LOGERR(1, "JSON RPC \"" << req << "\" failed");
+		static constexpr char err[] = "CallOnLoop failed";
+		LOGERR(1, err);
+		(*close_cb)(err, sizeof(err) - 1, 0.0);
 	}
 }
 

@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -52,6 +52,16 @@ struct Params
 	};
 
 	std::vector<Host> m_hosts;
+
+	struct MergeMiningHost
+	{
+		MergeMiningHost(const char* host, const char* wallet) : m_host(host), m_wallet(wallet) {}
+
+		std::string m_host;
+		std::string m_wallet;
+	};
+
+	std::vector<MergeMiningHost> m_mergeMiningHosts;
 
 	bool m_lightMode = false;
 	Wallet m_wallet{ nullptr };

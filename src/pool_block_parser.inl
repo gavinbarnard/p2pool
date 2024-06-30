@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -70,6 +70,8 @@ int PoolBlock::deserialize(const uint8_t* data, size_t size, const SideChain& si
 		READ_VARINT(m_timestamp);
 		READ_BUF(m_prevId.h, HASH_SIZE);
 
+		if (merge_mining_enabled() && (m_minorVersion > 127)) return __LINE__;
+
 		const int nonce_offset = static_cast<int>(data - data_begin);
 		READ_BUF(&m_nonce, NONCE_SIZE);
 
@@ -129,6 +131,8 @@ int PoolBlock::deserialize(const uint8_t* data, size_t size, const SideChain& si
 
 			outputs_blob_size = static_cast<int>(data - data_begin) - outputs_offset;
 			outputs_blob.assign(data_begin + outputs_offset, data);
+
+			m_sidechainId.clear();
 		}
 		else {
 			// Outputs are not in the buffer and must be calculated from sidechain data
@@ -144,6 +148,11 @@ int PoolBlock::deserialize(const uint8_t* data, size_t size, const SideChain& si
 			}
 
 			outputs_blob_size = static_cast<int>(tmp);
+
+			// Required by sidechain.get_outputs_blob() to speed up repeated broadcasts from different peers
+			if (merge_mining_enabled()) {
+				READ_BUF(m_sidechainId.h, HASH_SIZE);
+			}
 		}
 
 		// Technically some p2pool node could keep stuffing block with transactions until reward is less than 0.6 XMR
@@ -180,10 +189,41 @@ int PoolBlock::deserialize(const uint8_t* data, size_t size, const SideChain& si
 		}
 
 		EXPECT_BYTE(TX_EXTRA_MERGE_MINING_TAG);
-		EXPECT_BYTE(HASH_SIZE);
 
-		const int sidechain_hash_offset = static_cast<int>((data - data_begin) + outputs_blob_size_diff);
-		READ_BUF(m_sidechainId.h, HASH_SIZE);
+		int mm_root_hash_offset;
+		uint32_t mm_n_aux_chains, mm_nonce;
+
+		if (!merge_mining_enabled()) {
+			EXPECT_BYTE(HASH_SIZE);
+
+			mm_root_hash_offset = static_cast<int>((data - data_begin) + outputs_blob_size_diff);
+			READ_BUF(m_sidechainId.h, HASH_SIZE);
+
+			mm_n_aux_chains = 1;
+			mm_nonce = 0;
+
+			m_merkleRoot = static_cast<root_hash&>(m_sidechainId);
+			m_merkleTreeDataSize = 0;
+		}
+		else {
+			uint64_t mm_field_size;
+			READ_VARINT(mm_field_size);
+
+			const uint8_t* const mm_field_begin = data;
+
+			READ_VARINT(m_merkleTreeData);
+
+			m_merkleTreeDataSize = static_cast<uint32_t>(data - mm_field_begin);
+
+			decode_merkle_tree_data(mm_n_aux_chains, mm_nonce);
+
+			mm_root_hash_offset = static_cast<int>((data - data_begin) + outputs_blob_size_diff);
+			READ_BUF(m_merkleRoot.h, HASH_SIZE);
+
+			if (static_cast<uint64_t>(data - mm_field_begin) != mm_field_size) {
+				return __LINE__;
+			}
+		}
 
 		if (static_cast<uint64_t>(data - tx_extra_begin) != tx_extra_size) return __LINE__;
 
@@ -306,11 +346,71 @@ int PoolBlock::deserialize(const uint8_t* data, size_t size, const SideChain& si
 
 		READ_VARINT(m_sidechainHeight);
 
+		if (m_sidechainHeight > MAX_SIDECHAIN_HEIGHT) {
+			return __LINE__;
+		}
+
 		READ_VARINT(m_difficulty.lo);
 		READ_VARINT(m_difficulty.hi);
 
 		READ_VARINT(m_cumulativeDifficulty.lo);
 		READ_VARINT(m_cumulativeDifficulty.hi);
+
+		if (m_cumulativeDifficulty > MAX_CUMULATIVE_DIFFICULTY) {
+			return __LINE__;
+		}
+
+		m_merkleProof.clear();
+		m_mergeMiningExtra.clear();
+
+		if (merge_mining_enabled()) {
+			uint8_t merkle_proof_size;
+			READ_BYTE(merkle_proof_size);
+
+			if (merkle_proof_size > LOG2_MERGE_MINING_MAX_CHAINS) {
+				return __LINE__;
+			}
+
+			m_merkleProof.reserve(merkle_proof_size);
+
+			for (uint8_t i = 0; i < merkle_proof_size; ++i) {
+				hash h;
+				READ_BUF(h.h, HASH_SIZE);
+				m_merkleProof.emplace_back(h);
+			}
+
+			uint64_t mm_extra_data_count;
+			READ_VARINT(mm_extra_data_count);
+
+			if (mm_extra_data_count) {
+				// Sanity check
+				if (mm_extra_data_count > MERGE_MINING_MAX_CHAINS) return __LINE__;
+				if (static_cast<uint64_t>(data_end - data) < mm_extra_data_count * (HASH_SIZE + 1)) return __LINE__;
+
+				m_mergeMiningExtra.reserve(mm_extra_data_count);
+
+				for (uint64_t i = 0; i < mm_extra_data_count; ++i) {
+					hash chain_id;
+					READ_BUF(chain_id.h, HASH_SIZE);
+
+					// IDs must be ordered to avoid duplicates
+					if (i && !(m_mergeMiningExtra[i - 1].first < chain_id)) return __LINE__;
+
+					uint64_t n;
+					READ_VARINT(n);
+
+					// Sanity check
+					if (static_cast<uint64_t>(data_end - data) < n) return __LINE__;
+
+					std::vector<uint8_t> t;
+					t.resize(n);
+
+					READ_BUF(t.data(), n);
+
+					m_mergeMiningExtra.emplace_back(chain_id, std::move(t));
+				}
+			}
+		}
 
 		READ_BUF(m_sidechainExtraBuf, sizeof(m_sidechainExtraBuf));
 
@@ -347,7 +447,7 @@ int PoolBlock::deserialize(const uint8_t* data, size_t size, const SideChain& si
 		}
 
 		keccak_custom(
-			[nonce_offset, extra_nonce_offset, sidechain_hash_offset, data_begin, data_size, &consensus_id, &outputs_blob, outputs_blob_size_diff, outputs_offset, outputs_blob_size, transactions_blob, transactions_blob_size_diff, transactions_offset, transactions_blob_size](int offset) -> uint8_t
+			[nonce_offset, extra_nonce_offset, mm_root_hash_offset, data_begin, data_size, &consensus_id, &outputs_blob, outputs_blob_size_diff, outputs_offset, outputs_blob_size, transactions_blob, transactions_blob_size_diff, transactions_offset, transactions_blob_size](int offset) -> uint8_t
 			{
 				uint32_t k = static_cast<uint32_t>(offset - nonce_offset);
 				if (k < NONCE_SIZE) {
@@ -359,7 +459,7 @@ int PoolBlock::deserialize(const uint8_t* data, size_t size, const SideChain& si
 					return 0;
 				}
 
-				k = static_cast<uint32_t>(offset - sidechain_hash_offset);
+				k = static_cast<uint32_t>(offset - mm_root_hash_offset);
 				if (k < HASH_SIZE) {
 					return 0;
 				}
@@ -384,11 +484,20 @@ int PoolBlock::deserialize(const uint8_t* data, size_t size, const SideChain& si
 			},
 			static_cast<int>(size + outputs_blob_size_diff + transactions_blob_size_diff + consensus_id.size()), check.h, HASH_SIZE);
 
+		if (m_sidechainId.empty()) {
+			m_sidechainId = check;
+		}
+		else if (m_sidechainId != check) {
+			return __LINE__;
+		}
+
 #if POOL_BLOCK_DEBUG
 		m_sideChainDataDebug.assign(sidechain_data_begin, data_end);
 #endif
 
-		if (check != m_sidechainId) {
+		const uint32_t mm_aux_slot = get_aux_slot(sidechain.consensus_hash(), mm_nonce, mm_n_aux_chains);
+
+		if (!verify_merkle_proof(check, m_merkleProof, mm_aux_slot, mm_n_aux_chains, m_merkleRoot)) {
 			return __LINE__;
 		}
 	}

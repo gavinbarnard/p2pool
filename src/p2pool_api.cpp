@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -100,14 +100,24 @@ void p2pool_api::create_dir(const std::string& path)
 
 void p2pool_api::on_stop()
 {
+	MutexLock lock(m_dumpDataLock);
 	uv_close(reinterpret_cast<uv_handle_t*>(&m_dumpToFileAsync), nullptr);
 }
 
 void p2pool_api::dump_to_file_async_internal(Category category, const char* filename, Callback<void, log::Stream&>::Base&& callback)
 {
-	std::vector<char> buf(16384);
+	std::vector<char> buf(1024);
 	log::Stream s(buf.data(), buf.size());
 	callback(s);
+
+	// If the buffer was too small, try again with big enough buffer
+	if (s.m_spilled) {
+		// Assume that the second call will use no more than 2X bytes
+		buf.resize((static_cast<ptrdiff_t>(s.m_pos) + s.m_spilled) * 2 + 1);
+		s.reset(buf.data(), buf.size());
+		callback(s);
+	}
+
 	buf.resize(s.m_pos);
 
 	std::string path;
@@ -119,10 +129,8 @@ void p2pool_api::dump_to_file_async_internal(Category category, const char* file
 	case Category::LOCAL:   path = m_localPath   + filename; break;
 	}
 
-	{
-		MutexLock lock(m_dumpDataLock);
-		m_dumpData[path] = std::move(buf);
-	}
+	MutexLock lock(m_dumpDataLock);
+	m_dumpData[path] = std::move(buf);
 
 	if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&m_dumpToFileAsync))) {
 		uv_async_send(&m_dumpToFileAsync);

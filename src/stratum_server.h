@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -32,25 +32,25 @@ class StratumServer : public TCPServer
 {
 public:
 	explicit StratumServer(p2pool *pool);
-	~StratumServer();
+	~StratumServer() override;
 
 	void on_block(const BlockTemplate& block);
 
 	struct StratumClient : public Client
 	{
 		StratumClient();
-		FORCEINLINE ~StratumClient() {}
+		FORCEINLINE ~StratumClient() override {}
 
 		static Client* allocate() { return new StratumClient(); }
 		virtual size_t size() const override { return sizeof(StratumClient); }
 
 		void reset() override;
-		bool on_connect() override;
-		bool on_read(char* data, uint32_t size) override;
+		[[nodiscard]] bool on_connect() override;
+		[[nodiscard]] bool on_read(char* data, uint32_t size) override;
 
-		bool process_request(char* data, uint32_t size);
-		bool process_login(rapidjson::Document& doc, uint32_t id);
-		bool process_submit(rapidjson::Document& doc, uint32_t id);
+		[[nodiscard]] bool process_request(char* data, uint32_t size);
+		[[nodiscard]] bool process_login(rapidjson::Document& doc, uint32_t id);
+		[[nodiscard]] bool process_submit(rapidjson::Document& doc, uint32_t id);
 
 		alignas(8) char m_stratumReadBuf[STRATUM_BUF_SIZE];
 
@@ -61,6 +61,7 @@ public:
 		enum { 
 			JOBS_SIZE = 4,
 			AUTO_DIFF_SIZE = 64,
+			CUSTOM_USER_SIZE = 32,
 		};
 
 		struct SavedJob {
@@ -80,16 +81,16 @@ public:
 
 		difficulty_type m_customDiff;
 		difficulty_type m_autoDiff;
-		char m_customUser[32];
+		char m_customUser[CUSTOM_USER_SIZE];
 
 		uint64_t m_lastJobTarget;
 
 		int32_t m_score;
 	};
 
-	bool on_login(StratumClient* client, uint32_t id, const char* login);
-	bool on_submit(StratumClient* client, uint32_t id, const char* job_id_str, const char* nonce_str, const char* result_str);
-	uint32_t get_random32();
+	[[nodiscard]] bool on_login(StratumClient* client, uint32_t id, const char* login);
+	[[nodiscard]] bool on_submit(StratumClient* client, uint32_t id, const char* job_id_str, const char* nonce_str, const char* result_str);
+	[[nodiscard]] uint32_t get_random32();
 
 	void print_status() override;
 	void show_workers_async();
@@ -97,7 +98,7 @@ public:
 	void reset_share_counters();
 
 private:
-	const char* get_log_category() const override;
+	[[nodiscard]] const char* get_log_category() const override;
 
 	void print_stratum_status() const;
 	void update_auto_diff(StratumClient* client, const uint64_t timestamp, const uint64_t hashes);
@@ -127,6 +128,7 @@ private:
 	static void on_blobs_ready(uv_async_t* handle) { reinterpret_cast<StratumServer*>(handle->data)->on_blobs_ready(); }
 	void on_blobs_ready();
 
+	uv_mutex_t m_showWorkersLock;
 	uv_async_t m_showWorkersAsync;
 
 	static void on_show_workers(uv_async_t* handle) { reinterpret_cast<StratumServer*>(handle->data)->show_workers(); }
@@ -144,6 +146,8 @@ private:
 		StratumClient* m_client;
 		bool m_clientIPv6;
 		raw_ip m_clientAddr;
+		char m_clientAddrString[Client::ADDR_STRING_SIZE];
+		char m_clientCustomUser[StratumClient::CUSTOM_USER_SIZE];
 		uint32_t m_clientResetCounter;
 		uint32_t m_rpcId;
 		uint32_t m_id;

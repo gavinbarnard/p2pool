@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -69,12 +69,14 @@ private:
 		uint32_t m_blobSize = 0;
 		uint32_t m_templateId = 0;
 		difficulty_type m_diff = {};
+		difficulty_type m_auxDiff = {};
 		difficulty_type m_sidechainDiff = {};
 		uint64_t m_height = 0;
 		uint64_t m_sidechainHeight = 0;
 		size_t m_nonceOffset = 0;
 		uint32_t m_nonce = 0;
 		uint32_t m_extraNonce = 0;
+		std::vector<AuxChainData> m_auxChains = {};
 
 		void set_nonce(uint32_t nonce, uint32_t extra_nonce);
 	};

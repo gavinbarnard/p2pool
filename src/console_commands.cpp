@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  * Copyright (c) 2021 hyc <https://github.com/hyc>
  *
  * This program is free software: you can redistribute it and/or modify
@@ -35,7 +35,7 @@ static constexpr int DEFAULT_BACKLOG = 1;
 namespace p2pool {
 
 ConsoleCommands::ConsoleCommands(p2pool* pool)
-	: TCPServer(DEFAULT_BACKLOG, ConsoleClient::allocate)
+	: TCPServer(DEFAULT_BACKLOG, ConsoleClient::allocate, std::string())
 	, m_pool(pool)
 	, m_tty{}
 	, m_stdin_pipe{}
@@ -47,7 +47,41 @@ ConsoleCommands::ConsoleCommands(p2pool* pool)
 	LOGINFO(3, "uv_guess_handle returned " << static_cast<int>(stdin_type));
 	if (stdin_type != UV_TTY && stdin_type != UV_NAMED_PIPE) {
 		LOGERR(1, "tty or named pipe is not available");
-		throw std::exception();
+	}
+
+	int err;
+
+	if (stdin_type == UV_TTY) {
+		LOGINFO(3, "processing stdin as UV_TTY");
+		err = uv_tty_init(&m_loop, &m_tty, 0, 1);
+		if (err) {
+			LOGERR(1, "uv_tty_init failed, error " << uv_err_name(err));
+			throw std::exception();
+		}
+		m_stdin_handle = reinterpret_cast<uv_stream_t*>(&m_tty);
+	}
+	else if (stdin_type == UV_NAMED_PIPE) {
+		LOGINFO(3, "processing stdin as UV_NAMED_PIPE");
+		err = uv_pipe_init(&m_loop, &m_stdin_pipe, 0);
+		if (err) {
+			LOGERR(1, "uv_pipe_init failed, error " << uv_err_name(err));
+			throw std::exception();
+		}
+		m_stdin_handle = reinterpret_cast<uv_stream_t*>(&m_stdin_pipe);
+		err = uv_pipe_open(&m_stdin_pipe, 0);
+		if (err) {
+			LOGERR(1, "uv_pipe_open failed, error " << uv_err_name(err));
+			throw std::exception();
+		}
+	}
+
+	if (m_stdin_handle) {
+		m_stdin_handle->data = this;
+		err = uv_read_start(m_stdin_handle, allocCallback, stdinReadCallback);
+		if (err) {
+			LOGERR(1, "uv_read_start failed, error " << uv_err_name(err));
+			throw std::exception();
+		}
 	}
 
 	std::random_device rd;
@@ -67,43 +101,20 @@ ConsoleCommands::ConsoleCommands(p2pool* pool)
 		m_pool->api()->set(p2pool_api::Category::LOCAL, "console",
 			[stdin_type, this](log::Stream& s)
 			{
-				s << "{\"mode\":" << ((stdin_type == UV_TTY) ? "\"tty\"" : "\"pipe\"")
-					<< ",\"tcp_port\":" << m_listenPort
-					<< "}";
+				s << "{\"mode\":\"";
+
+				if (stdin_type == UV_TTY) {
+					s << "tty";
+				}
+				else if (stdin_type == UV_NAMED_PIPE) {
+					s << "pipe";
+				}
+				else {
+					s << static_cast<int>(stdin_type);
+				}
+
+				s << "\",\"tcp_port\":" << m_listenPort << '}';
 			});
-	}
-
-	int err;
-
-	if (stdin_type == UV_TTY) {
-		LOGINFO(3, "processing stdin as UV_TTY");
-		err = uv_tty_init(&m_loop, &m_tty, 0, 1);
-		if (err) {
-			LOGERR(1, "uv_tty_init failed, error " << uv_err_name(err));
-			throw std::exception();
-		}
-		m_stdin_handle = reinterpret_cast<uv_stream_t*>(&m_tty);
-	}
-	else {
-		LOGINFO(3, "processing stdin as UV_NAMED_PIPE");
-		err = uv_pipe_init(&m_loop, &m_stdin_pipe, 0);
-		if (err) {
-			LOGERR(1, "uv_pipe_init failed, error " << uv_err_name(err));
-			throw std::exception();
-		}
-		m_stdin_handle = reinterpret_cast<uv_stream_t*>(&m_stdin_pipe);
-		err = uv_pipe_open(&m_stdin_pipe, 0);
-		if (err) {
-			LOGERR(1, "uv_pipe_open failed, error " << uv_err_name(err));
-			throw std::exception();
-		}
-	}
-	m_stdin_handle->data = this;
-
-	err = uv_read_start(m_stdin_handle, allocCallback, stdinReadCallback);
-	if (err) {
-		LOGERR(1, "uv_read_start failed, error " << uv_err_name(err));
-		throw std::exception();
 	}
 
 	err = uv_thread_create(&m_loopThread, loop, this);
@@ -111,16 +122,15 @@ ConsoleCommands::ConsoleCommands(p2pool* pool)
 		LOGERR(1, "failed to start event loop thread, error " << uv_err_name(err));
 		throw std::exception();
 	}
-}
 
-ConsoleCommands::~ConsoleCommands()
-{
-	shutdown_tcp();
+	m_loopThreadCreated = true;
 }
 
 void ConsoleCommands::on_shutdown()
 {
-	uv_close(reinterpret_cast<uv_handle_t*>(m_stdin_handle), nullptr);
+	if (m_stdin_handle) {
+		uv_close(reinterpret_cast<uv_handle_t*>(m_stdin_handle), nullptr);
+	}
 }
 
 const char* ConsoleCommands::get_log_category() const
@@ -187,13 +197,23 @@ static void do_status(p2pool *m_pool, const char * /* args */)
 	if (m_pool->stratum_server()) {
 		m_pool->stratum_server()->print_status();
 	}
-	if (m_pool->p2p_server()) {
-		m_pool->p2p_server()->print_status();
+
+	P2PServer* p2p = m_pool->p2p_server();
+	if (p2p) {
+		p2p->print_status();
 	}
+
 #ifdef WITH_RANDOMX
 	m_pool->print_miner_status();
 #endif
+
+	m_pool->print_merge_mining_status();
+
 	bkg_jobs_tracker.print_status();
+
+	if (p2p) {
+		p2p->check_for_updates(true);
+	}
 }
 
 static void do_loglevel(p2pool * /* m_pool */, const char *args)
@@ -297,9 +317,15 @@ static void do_exit(p2pool *m_pool, const char * /* args */)
 	m_pool->stop();
 }
 
-static void do_version(p2pool* /* m_pool */, const char* /* args */)
+// cppcheck-suppress constParameterCallback
+static void do_version(p2pool* m_pool, const char* /* args */)
 {
 	LOGINFO(0, log::LightCyan() << VERSION);
+
+	const P2PServer* p2p = m_pool->p2p_server();
+	if (p2p) {
+		p2p->check_for_updates(true);
+	}
 }
 
 void ConsoleCommands::allocCallback(uv_handle_t* handle, size_t /*suggested_size*/, uv_buf_t* buf)
@@ -373,6 +399,15 @@ void ConsoleCommands::process_input(std::string& command, char* data, uint32_t s
 		k = command.find_first_not_of("\r\n", k + 1);
 		command.erase(0, k);
 	} while (true);
+}
+
+ConsoleCommands::~ConsoleCommands()
+{
+#ifdef DEV_TEST_SYNC
+	do_status(m_pool, nullptr);
+#endif
+
+	shutdown_tcp();
 }
 
 } // namespace p2pool

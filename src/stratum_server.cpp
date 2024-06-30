@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -33,6 +33,8 @@ static constexpr uint64_t AUTO_DIFF_TARGET_TIME = 30;
 // Use short target format (4 bytes) for diff <= 4 million
 static constexpr uint64_t TARGET_4_BYTES_LIMIT = std::numeric_limits<uint64_t>::max() / 4000001;
 
+static constexpr uint64_t AUTODIFF_START = std::numeric_limits<uint64_t>::max() / 500001;
+
 static constexpr int32_t BAD_SHARE_POINTS = -5;
 static constexpr int32_t GOOD_SHARE_POINTS = 1;
 static constexpr int32_t BAN_THRESHOLD_POINTS = -15;
@@ -40,7 +42,7 @@ static constexpr int32_t BAN_THRESHOLD_POINTS = -15;
 namespace p2pool {
 
 StratumServer::StratumServer(p2pool* pool)
-	: TCPServer(DEFAULT_BACKLOG, StratumClient::allocate)
+	: TCPServer(DEFAULT_BACKLOG, StratumClient::allocate, std::string())
 	, m_pool(pool)
 	, m_autoDiff(pool->params().m_autoDiff)
 	, m_rng(RandomDeviceSeed::instance)
@@ -63,6 +65,7 @@ StratumServer::StratumServer(p2pool* pool)
 	m_hashrateData[0] = { seconds_since_epoch(), 0 };
 
 	uv_mutex_init_checked(&m_blobsQueueLock);
+	uv_mutex_init_checked(&m_showWorkersLock);
 	uv_mutex_init_checked(&m_rngLock);
 	uv_rwlock_init_checked(&m_hashrateDataLock);
 
@@ -90,7 +93,16 @@ StratumServer::~StratumServer()
 {
 	shutdown_tcp();
 
+	{
+		MutexLock lock(m_blobsQueueLock);
+
+		for (BlobsData* data : m_blobsQueue) {
+			delete data;
+		}
+	}
+
 	uv_mutex_destroy(&m_blobsQueueLock);
+	uv_mutex_destroy(&m_showWorkersLock);
 	uv_mutex_destroy(&m_rngLock);
 	uv_rwlock_destroy(&m_hashrateDataLock);
 
@@ -118,6 +130,7 @@ void StratumServer::on_block(const BlockTemplate& block)
 	blobs_data->m_extraNonceStart = extra_nonce_start;
 
 	difficulty_type difficulty;
+	difficulty_type aux_diff;
 	difficulty_type sidechain_difficulty;
 	size_t nonce_offset;
 
@@ -125,7 +138,7 @@ void StratumServer::on_block(const BlockTemplate& block)
 	// Even if they do, they'll be added to the beginning of the list and will get their block template in on_login()
 	// We'll iterate through the list backwards so when we get to the beginning and run out of extra_nonce values, it'll be only new clients left
 	blobs_data->m_numClientsExpected = num_connections;
-	blobs_data->m_blobSize = block.get_hashing_blobs(extra_nonce_start, num_connections, blobs_data->m_blobs, blobs_data->m_height, difficulty, sidechain_difficulty, blobs_data->m_seedHash, nonce_offset, blobs_data->m_templateId);
+	blobs_data->m_blobSize = block.get_hashing_blobs(extra_nonce_start, num_connections, blobs_data->m_blobs, blobs_data->m_height, difficulty, aux_diff, sidechain_difficulty, blobs_data->m_seedHash, nonce_offset, blobs_data->m_templateId);
 
 	// Integrity checks
 	if (blobs_data->m_blobSize < 76) {
@@ -134,7 +147,7 @@ void StratumServer::on_block(const BlockTemplate& block)
 	else if (blobs_data->m_blobs.size() != blobs_data->m_blobSize * num_connections) {
 		LOGERR(1, "internal error: get_hashing_blobs returned wrong amount of data");
 	}
-	else if (num_connections > 1) {
+	else if (pool_block_debug() && (num_connections > 1)) {
 		std::vector<uint64_t> blob_hashes;
 		blob_hashes.reserve(num_connections);
 
@@ -158,32 +171,23 @@ void StratumServer::on_block(const BlockTemplate& block)
 	}
 
 	blobs_data->m_target = std::max(difficulty.target(), sidechain_difficulty.target());
+	blobs_data->m_target = std::max(blobs_data->m_target, aux_diff.target());
 
 	{
 		MutexLock lock(m_blobsQueueLock);
-		m_blobsQueue.push_back(blobs_data);
-	}
 
-	if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&m_blobsAsync))) {
-		return;
-	}
-
-	const int err = uv_async_send(&m_blobsAsync);
-	if (err) {
-		LOGERR(1, "uv_async_send failed, error " << uv_err_name(err));
-
-		bool found = false;
-		{
-			MutexLock lock(m_blobsQueueLock);
-
-			auto it = std::find(m_blobsQueue.begin(), m_blobsQueue.end(), blobs_data);
-			if (it != m_blobsQueue.end()) {
-				found = true;
-				m_blobsQueue.erase(it);
-			}
+		if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&m_blobsAsync))) {
+			delete blobs_data;
+			return;
 		}
 
-		if (found) {
+		m_blobsQueue.push_back(blobs_data);
+
+		const int err = uv_async_send(&m_blobsAsync);
+		if (err) {
+			LOGERR(1, "uv_async_send failed, error " << uv_err_name(err));
+
+			m_blobsQueue.pop_back();
 			delete blobs_data;
 		}
 	}
@@ -205,8 +209,8 @@ static bool get_custom_user(const char* s, char (&user)[N])
 		if ((c == '+') || (c == '.')) {
 			break;
 		}
-		// Limit to printable ASCII characters
-		if (c >= ' ' && c <= '~') {
+		// Limit to printable ASCII characters, also skip comma and JSON special characters
+		if (c >= ' ' && c <= '~' && c != ',' && c != '"' && c != '\\') {
 			user[len++] = c;
 		}
 		++s;
@@ -246,19 +250,26 @@ static bool get_custom_diff(const char* s, difficulty_type& diff)
 
 bool StratumServer::on_login(StratumClient* client, uint32_t id, const char* login)
 {
+	if (client->m_rpcId) {
+		LOGWARN(4, "client " << static_cast<char*>(client->m_addrString) << " tried to login, but it's already logged in");
+		return false;
+	}
+
 	const uint32_t extra_nonce = m_extraNonce.fetch_add(1);
 
 	uint8_t hashing_blob[128];
 	uint64_t height, sidechain_height;
 	difficulty_type difficulty;
+	difficulty_type aux_diff;
 	difficulty_type sidechain_difficulty;
 	hash seed_hash;
 	size_t nonce_offset;
 	uint32_t template_id;
 
-	const size_t blob_size = m_pool->block_template().get_hashing_blob(extra_nonce, hashing_blob, height, sidechain_height, difficulty, sidechain_difficulty, seed_hash, nonce_offset, template_id);
+	const size_t blob_size = m_pool->block_template().get_hashing_blob(extra_nonce, hashing_blob, height, sidechain_height, difficulty, aux_diff, sidechain_difficulty, seed_hash, nonce_offset, template_id);
 
 	uint64_t target = std::max(difficulty.target(), sidechain_difficulty.target());
+	target = std::max(target, aux_diff.target());
 
 	if (get_custom_diff(login, client->m_customDiff)) {
 		LOGINFO(5, "client " << log::Gray() << static_cast<char*>(client->m_addrString) << " set custom difficulty " << client->m_customDiff);
@@ -266,7 +277,7 @@ bool StratumServer::on_login(StratumClient* client, uint32_t id, const char* log
 	}
 	else if (m_autoDiff) {
 		// Limit autodiff to 4000000 for maximum compatibility
-		target = std::max(target, TARGET_4_BYTES_LIMIT);
+		target = std::max(std::max(target, AUTODIFF_START), TARGET_4_BYTES_LIMIT);
 	}
 
 	if (get_custom_user(login, client->m_customUser)) {
@@ -370,11 +381,11 @@ bool StratumServer::on_submit(StratumClient* client, uint32_t id, const char* jo
 	}
 
 	if (found) {
-		BlockTemplate& block = m_pool->block_template();
+		const BlockTemplate& block = m_pool->block_template();
 		uint64_t height, sidechain_height;
-		difficulty_type mainchain_diff, sidechain_diff;
+		difficulty_type mainchain_diff, aux_diff, sidechain_diff;
 
-		if (!block.get_difficulties(template_id, height, sidechain_height, mainchain_diff, sidechain_diff)) {
+		if (!block.get_difficulties(template_id, height, sidechain_height, mainchain_diff, aux_diff, sidechain_diff)) {
 			LOGWARN(4, "client " << static_cast<char*>(client->m_addrString) << " got a stale share");
 			return send(client,
 				[id](uint8_t* buf, size_t buf_size)
@@ -389,6 +400,25 @@ bool StratumServer::on_submit(StratumClient* client, uint32_t id, const char* jo
 			const char* s = client->m_customUser;
 			LOGINFO(0, log::Green() << "client " << static_cast<char*>(client->m_addrString) << (*s ? " user " : "") << s << " found a mainchain block at height " << height << ", submitting it");
 			m_pool->submit_block_async(template_id, nonce, extra_nonce);
+		}
+
+		if (aux_diff.check_pow(resultHash)) {
+			const std::vector<AuxChainData> aux_chains = block.get_aux_chains(template_id);
+
+			std::vector<p2pool::SubmitAuxBlockData> aux_blocks;
+			aux_blocks.reserve(aux_chains.size());
+
+			for (const AuxChainData& aux_data : aux_chains) {
+				if (aux_data.difficulty.check_pow(resultHash)) {
+					const char* s = client->m_customUser;
+					LOGINFO(0, log::Green() << "client " << static_cast<char*>(client->m_addrString) << (*s ? " user " : "") << s << " found an aux block for chain_id " << aux_data.unique_id << ", diff " << aux_data.difficulty << ", submitting it");
+					aux_blocks.emplace_back(p2pool::SubmitAuxBlockData{ aux_data.unique_id, template_id, nonce, extra_nonce });
+				}
+			}
+
+			if (!aux_blocks.empty()) {
+				m_pool->submit_aux_block_async(aux_blocks);
+			}
 		}
 
 		SubmittedShare* share;
@@ -412,6 +442,8 @@ bool StratumServer::on_submit(StratumClient* client, uint32_t id, const char* jo
 		share->m_client = client;
 		share->m_clientIPv6 = client->m_isV6;
 		share->m_clientAddr = client->m_addr;
+		memcpy(share->m_clientAddrString, client->m_addrString, sizeof(share->m_clientAddrString));
+		memcpy(share->m_clientCustomUser, client->m_customUser, sizeof(share->m_clientCustomUser));
 		share->m_clientResetCounter = client->m_resetCounter.load();
 		share->m_rpcId = client->m_rpcId;
 		share->m_id = id;
@@ -487,6 +519,8 @@ void StratumServer::print_status()
 
 void StratumServer::show_workers_async()
 {
+	MutexLock lock(m_showWorkersLock);
+
 	if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&m_showWorkersAsync))) {
 		uv_async_send(&m_showWorkersAsync);
 	}
@@ -755,7 +789,9 @@ void StratumServer::on_blobs_ready()
 				target = std::max(target, client->m_autoDiff.target());
 			}
 			else {
-				// Not enough shares from the client yet, cut diff in half every 16 seconds
+				// Not enough shares from the client yet, start with 500k diff and cut diff in half every 16 seconds
+				target = std::max(target, AUTODIFF_START);
+
 				const uint64_t num_halvings = (cur_time - client->m_connectedTime) / 16;
 				constexpr uint64_t max_target = (std::numeric_limits<uint64_t>::max() / MIN_DIFF) + 1;
 				for (uint64_t i = 0; (i < num_halvings) && (target < max_target); ++i) {
@@ -859,7 +895,6 @@ void StratumServer::on_share_found(uv_work_t* req)
 		BACKGROUND_JOB_START(StratumServer::on_share_found);
 	}
 
-	StratumClient* client = share->m_client;
 	p2pool* pool = server->m_pool;
 
 	const uint64_t target = share->m_target;
@@ -925,6 +960,61 @@ void StratumServer::on_share_found(uv_work_t* req)
 	}
 
 	if (share->m_highEnoughDifficulty) {
+		uint8_t blob[128];
+		uint64_t height;
+		difficulty_type difficulty;
+		difficulty_type aux_diff;
+		difficulty_type sidechain_difficulty;
+		hash seed_hash;
+		size_t nonce_offset;
+
+		const uint32_t blob_size = pool->block_template().get_hashing_blob(share->m_templateId, share->m_extraNonce, blob, height, difficulty, aux_diff, sidechain_difficulty, seed_hash, nonce_offset);
+		if (!blob_size) {
+			LOGWARN(4, "client " << static_cast<char*>(share->m_clientAddrString) << " got a stale share");
+			share->m_result = SubmittedShare::Result::STALE;
+			return;
+		}
+
+		for (uint32_t i = 0, nonce = share->m_nonce; i < sizeof(share->m_nonce); ++i) {
+			blob[nonce_offset + i] = nonce & 255;
+			nonce >>= 8;
+		}
+
+		hash pow_hash;
+		if (!pool->calculate_hash(blob, blob_size, height, seed_hash, pow_hash, false)) {
+			LOGWARN(3, "client " << static_cast<char*>(share->m_clientAddrString) << " couldn't check share PoW");
+			share->m_result = SubmittedShare::Result::COULDNT_CHECK_POW;
+			return;
+		}
+
+		if (pow_hash != share->m_resultHash) {
+			LOGWARN(4, "client " << static_cast<char*>(share->m_clientAddrString) << " submitted a share with invalid PoW");
+			share->m_result = SubmittedShare::Result::INVALID_POW;
+			share->m_score = BAD_SHARE_POINTS;
+
+			// Calculate the same hash second time to check if it's an unstable hardware that caused this
+			hash pow_hash2;
+			if (pool->calculate_hash(blob, blob_size, height, seed_hash, pow_hash2, true) && (pow_hash2 != pow_hash)) {
+				LOGERR(0, "UNSTABLE HARDWARE DETECTED: Calculated the same hash twice, got different results: " << pow_hash << " != " << pow_hash2);
+			}
+
+			return;
+		}
+
+		share->m_score = GOOD_SHARE_POINTS;
+
+		const double diff = sidechain_difficulty.to_double();
+		{
+			WriteLock lock(server->m_hashrateDataLock);
+
+			const uint64_t n = server->m_cumulativeHashes + hashes;
+			share->m_effort = static_cast<double>(n - server->m_cumulativeHashesAtLastShare) * 100.0 / diff;
+			server->m_cumulativeHashesAtLastShare = n;
+
+			server->m_cumulativeFoundSharesDiff += diff;
+			++server->m_totalFoundShares;
+		}
+
 		if (!pool->submit_sidechain_block(share->m_templateId, share->m_nonce, share->m_extraNonce)) {
 			WriteLock lock(server->m_hashrateDataLock);
 
@@ -945,7 +1035,7 @@ void StratumServer::on_share_found(uv_work_t* req)
 		share->m_result = SubmittedShare::Result::OK;
 	}
 	else {
-		LOGWARN(4, "client " << static_cast<char*>(client->m_addrString) << " got a low diff share");
+		LOGWARN(4, "client " << static_cast<char*>(share->m_clientAddrString) << " got a low diff share");
 		share->m_result = SubmittedShare::Result::LOW_DIFF;
 		share->m_score = BAD_SHARE_POINTS;
 	}
@@ -954,13 +1044,11 @@ void StratumServer::on_share_found(uv_work_t* req)
 void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 {
 	SubmittedShare* share = reinterpret_cast<SubmittedShare*>(req->data);
-	StratumClient* client = share->m_client;
-	client->m_score += share->m_score;
 
 	if (share->m_highEnoughDifficulty) {
-		const char* s = client->m_customUser;
+		const char* s = share->m_clientCustomUser;
 		if (share->m_result == SubmittedShare::Result::OK) {
-			LOGINFO(0, log::Green() << "SHARE FOUND: mainchain height " << share->m_mainchainHeight << ", sidechain height " << share->m_sidechainHeight << ", diff " << share->m_sidechainDifficulty << ", client " << static_cast<char*>(client->m_addrString) << (*s ? ", user " : "") << s << ", effort " << share->m_effort << '%');
+			LOGINFO(0, log::Green() << "SHARE FOUND: mainchain height " << share->m_mainchainHeight << ", sidechain height " << share->m_sidechainHeight << ", diff " << share->m_sidechainDifficulty << ", client " << static_cast<char*>(share->m_clientAddrString) << (*s ? ", user " : "") << s << ", effort " << share->m_effort << '%');
 		}
 		else {
 			static const char* reason_list[] = {
@@ -974,7 +1062,7 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 
 			const size_t k = static_cast<size_t>(share->m_result);
 			const char* reason = (k < array_size(reason_list)) ? reason_list[k] : "unknown";
-			LOGWARN(0, "INVALID SHARE: mainchain height " << share->m_mainchainHeight << ", sidechain height " << share->m_sidechainHeight << ", diff " << share->m_sidechainDifficulty << ", client " << static_cast<char*>(client->m_addrString) << (*s ? ", user " : "") << s << ", reason: " << reason);
+			LOGWARN(0, "INVALID SHARE: mainchain height " << share->m_mainchainHeight << ", sidechain height " << share->m_sidechainHeight << ", diff " << share->m_sidechainDifficulty << ", client " << static_cast<char*>(share->m_clientAddrString) << (*s ? ", user " : "") << s << ", reason: " << reason);
 		}
 		BACKGROUND_JOB_STOP(StratumServer::on_share_found);
 	}
@@ -989,7 +1077,9 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 
 	const bool bad_share = (share->m_result == SubmittedShare::Result::LOW_DIFF) || (share->m_result == SubmittedShare::Result::INVALID_POW);
 
-	if ((client->m_resetCounter.load() == share->m_clientResetCounter) && (client->m_rpcId == share->m_rpcId)) {
+	StratumClient* client = share->m_client;
+
+	if (client->m_resetCounter.load() == share->m_clientResetCounter) {
 		const bool result = server->send(client,
 			[share](uint8_t* buf, size_t buf_size)
 			{
@@ -1017,6 +1107,8 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 				return s.m_pos;
 			});
 
+		client->m_score += share->m_score;
+
 		if (bad_share && (client->m_score <= BAN_THRESHOLD_POINTS)) {
 			client->ban(DEFAULT_BAN_TIME);
 			client->close();
@@ -1032,8 +1124,14 @@ void StratumServer::on_after_share_found(uv_work_t* req, int /*status*/)
 
 void StratumServer::on_shutdown()
 {
-	uv_close(reinterpret_cast<uv_handle_t*>(&m_blobsAsync), nullptr);
-	uv_close(reinterpret_cast<uv_handle_t*>(&m_showWorkersAsync), nullptr);
+	{
+		MutexLock lock(m_blobsQueueLock);
+		uv_close(reinterpret_cast<uv_handle_t*>(&m_blobsAsync), nullptr);
+	}
+	{
+		MutexLock lock(m_showWorkersLock);
+		uv_close(reinterpret_cast<uv_handle_t*>(&m_showWorkersAsync), nullptr);
+	}
 }
 
 StratumServer::StratumClient::StratumClient()
@@ -1267,7 +1365,7 @@ bool StratumServer::StratumClient::process_submit(rapidjson::Document& doc, uint
 
 void StratumServer::api_update_local_stats(uint64_t timestamp)
 {
-	if (!m_pool->api() || !m_pool->params().m_localStats) {
+	if (!m_pool->api() || !m_pool->params().m_localStats || m_pool->stopped()) {
 		return;
 	}
 
@@ -1333,10 +1431,9 @@ void StratumServer::api_update_local_stats(uint64_t timestamp)
 
 	const double block_reward_share_percent = m_pool->side_chain().get_reward_share(m_pool->params().m_wallet) * 100.0;
 
-	m_pool->api()->set(p2pool_api::Category::LOCAL, "stratum",
-		[hashrate_15m, hashrate_1h, hashrate_24h, total_hashes, reward, pshares, shares_found, shares_failed, average_effort, current_effort, connections, incoming_connections, block_reward_share_percent](log::Stream& s)
-		{
-			s << "{\"hashrate_15m\":" << hashrate_15m
+	CallOnLoop(&m_loop, [=]() {
+		m_pool->api()->set(p2pool_api::Category::LOCAL, "stratum", [=](log::Stream& s) {
+			s	<< "{\"hashrate_15m\":" << hashrate_15m
 				<< ",\"hashrate_1h\":" << hashrate_1h
 				<< ",\"hashrate_24h\":" << hashrate_24h
 				<< ",\"total_hashes\":" << total_hashes
@@ -1349,8 +1446,38 @@ void StratumServer::api_update_local_stats(uint64_t timestamp)
 				<< ",\"connections\":" << connections
 				<< ",\"incoming_connections\":" << incoming_connections
 				<< ",\"block_reward_share_percent\":" << block_reward_share_percent
-				<< "}";
+				<< ",\"workers\":[";
+
+			const difficulty_type pool_diff = m_pool->side_chain().difficulty();
+			bool first = true;
+
+			for (const StratumClient* client = static_cast<StratumClient*>(m_connectedClientsList->m_next); client != m_connectedClientsList; client = static_cast<StratumClient*>(client->m_next)) {
+				if (!first) {
+					s << ',';
+				}
+				difficulty_type diff = pool_diff;
+				if (client->m_lastJobTarget > 1) {
+					uint64_t r;
+					diff.lo = udiv128(1, 0, client->m_lastJobTarget, &r);
+					diff.hi = 0;
+					if (r) {
+						++diff.lo;
+					}
+				}
+
+				s 	<< '"' << static_cast<const char*>(client->m_addrString) << ','
+					<< (timestamp - client->m_connectedTime) << ','
+					<< diff << ','
+					<< (client->m_autoDiff.lo / AUTO_DIFF_TARGET_TIME) << ','
+					<< (client->m_rpcId ? client->m_customUser : "not logged in")
+					<< '"';
+
+				first = false;
+			}
+
+			s	<< "]}";
 		});
+	});
 }
 
 } // namespace p2pool

@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -33,13 +33,14 @@ class Miner;
 class ConsoleCommands;
 class p2pool_api;
 class ZMQReader;
+class IMergeMiningClient;
 struct PoolBlock;
 
 class p2pool : public MinerCallbackHandler, public nocopy_nomove
 {
 public:
 	p2pool(int argc, char* argv[]);
-	~p2pool();
+	~p2pool() override;
 
 	int run();
 
@@ -79,12 +80,27 @@ public:
 	void print_miner_status();
 #endif
 
+	void print_merge_mining_status() const;
+
 	virtual void handle_tx(TxMempoolData& tx) override;
 	virtual void handle_miner_data(MinerData& data) override;
 	virtual void handle_chain_main(ChainMain& data, const char* extra) override;
 
+	void update_aux_data(const hash& chain_id);
+
 	void submit_block_async(uint32_t template_id, uint32_t nonce, uint32_t extra_nonce);
 	void submit_block_async(std::vector<uint8_t>&& blob);
+
+	struct SubmitAuxBlockData
+	{
+		hash chain_id;
+		uint32_t template_id = 0;
+		uint32_t nonce = 0;
+		uint32_t extra_nonce = 0;
+	};
+
+	void submit_aux_block_async(const std::vector<SubmitAuxBlockData>& aux_blocks);
+
 	bool submit_sidechain_block(uint32_t template_id, uint32_t nonce, uint32_t extra_nonce);
 
 	void update_block_template_async(bool is_alternative_block = false);
@@ -117,11 +133,13 @@ private:
 	const Params::Host& switch_host();
 
 	static void on_submit_block(uv_async_t* async) { reinterpret_cast<p2pool*>(async->data)->submit_block(); }
+	static void on_submit_aux_block(uv_async_t* async) { reinterpret_cast<p2pool*>(async->data)->submit_aux_block(); }
 	static void on_update_block_template(uv_async_t* async) { reinterpret_cast<p2pool*>(async->data)->update_block_template(); }
 	static void on_stop(uv_async_t*);
 	static void on_reconnect_to_host(uv_async_t* async) { reinterpret_cast<p2pool*>(async->data)->reconnect_to_host(); }
 
 	void submit_block() const;
+	void submit_aux_block() const;
 
 	std::atomic<bool> m_stopped;
 
@@ -213,7 +231,11 @@ private:
 	mutable uv_mutex_t m_submitBlockDataLock;
 	SubmitBlockData m_submitBlockData;
 
+	mutable uv_mutex_t m_submitAuxBlockDataLock;
+	mutable std::vector<SubmitAuxBlockData> m_submitAuxBlockData;
+
 	uv_async_t m_submitBlockAsync;
+	uv_async_t m_submitAuxBlockAsync;
 	uv_async_t m_blockTemplateAsync;
 	uv_async_t m_stopAsync;
 
@@ -225,6 +247,13 @@ private:
 
 	mutable uv_rwlock_t m_ZMQReaderLock;
 	ZMQReader* m_ZMQReader = nullptr;
+
+	mutable uv_rwlock_t m_mergeMiningClientsLock;
+	std::vector<IMergeMiningClient*> m_mergeMiningClients;
+
+	mutable uv_rwlock_t m_auxIdLock;
+	std::vector<hash> m_auxId;
+	uint32_t m_auxNonce = 0;
 
 	hash m_getMinerDataHash;
 	bool m_getMinerDataPending = false;

@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -86,8 +86,9 @@ struct BlockCache::Impl : public nocopy_nomove
 #elif defined(_WIN32)
 
 	Impl()
+		: m_file(CreateFile(cache_name, GENERIC_ALL, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL))
+		, m_map(0)
 	{
-		m_file = CreateFile(cache_name, GENERIC_ALL, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
 		if (m_file == INVALID_HANDLE_VALUE) {
 			LOGERR(1, "couldn't open " << cache_name << ", error " << static_cast<uint32_t>(GetLastError()));
 			return;
@@ -140,8 +141,8 @@ struct BlockCache::Impl : public nocopy_nomove
 		}
 	}
 
-	HANDLE m_file = INVALID_HANDLE_VALUE;
-	HANDLE m_map = 0;
+	HANDLE m_file;
+	HANDLE m_map;
 
 #else
 	// Not implemented on other platforms

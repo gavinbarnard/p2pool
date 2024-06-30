@@ -1,3 +1,18 @@
+# This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
+# Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, version 3.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+
 import socket
 import time
 import sys
@@ -5,19 +20,26 @@ import json
 
 f = open('stratum_dummy' + sys.argv[1] + '.log', 'wb')
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.settimeout(1)
-sock.setblocking(True)
-
 f.write(b'Connecting')
-time.sleep(5)
+f.flush()
 
-while sock.connect_ex(('127.0.0.1', 3333)) != 0:
+while True:
+	sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+	sock.settimeout(1)
+	sock.setblocking(True)
+
+	if sock.connect_ex(('127.0.0.1', 3333)) == 0:
+		break;
+
+	sock.close()
+
 	f.write(b'.')
+	f.flush()
 	print('.')
 	time.sleep(1)
 
 f.write(b'\n')
+f.flush()
 
 diff = ''
 

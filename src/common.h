@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,7 +19,7 @@
 
 #ifdef _MSC_VER
 
-#pragma warning(disable : 4005 4061 4324 4365 4464 4619 4625 4626 4668 4710 4711 4804 4820 5039 5045 5220 5246 5264)
+#pragma warning(disable : 4005 4061 4324 4365 4464 4619 4625 4626 4668 4710 4711 4714 4804 4820 5039 5045 5220 5246 5264)
 #define FORCEINLINE __forceinline
 #define NOINLINE __declspec(noinline)
 #define LIKELY(expression) expression
@@ -67,10 +67,18 @@
 
 #ifdef _WIN32
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+
 #include <Windows.h>
 
 #elif defined(__linux__) || defined(__unix__) || defined(_POSIX_VERSION) || defined(__MACH__)
@@ -89,6 +97,7 @@
 #endif
 
 #if __has_feature(address_sanitizer) || defined(__SANITIZE_ADDRESS__)
+#define P2POOL_ASAN
 #define ASAN_POISON_MEMORY_REGION(addr, size) __asan_poison_memory_region((addr), (size))
 #define ASAN_UNPOISON_MEMORY_REGION(addr, size) __asan_unpoison_memory_region((addr), (size))
 extern "C" void __asan_poison_memory_region(void const volatile* addr, size_t size);
@@ -181,6 +190,10 @@ struct alignas(uint64_t) hash
 		return (a[0] == 0) && (a[1] == 0) && (a[2] == 0) && (a[3] == 0);
 	}
 
+	FORCEINLINE void clear() {
+		memset(h, 0, HASH_SIZE);
+	}
+
 	FORCEINLINE uint64_t* u64() { return reinterpret_cast<uint64_t*>(h); }
 	FORCEINLINE const uint64_t* u64() const { return reinterpret_cast<const uint64_t*>(h); }
 
@@ -188,8 +201,16 @@ struct alignas(uint64_t) hash
 	friend std::istream& operator>>(std::istream& s, hash& d);
 };
 
+struct root_hash : public hash
+{
+	FORCEINLINE root_hash() : hash() {}
+	explicit FORCEINLINE root_hash(const hash& h) : hash(h) {}
+};
+
 static_assert(sizeof(hash) == HASH_SIZE, "struct hash has invalid size, check your compiler options");
+static_assert(sizeof(root_hash) == HASH_SIZE, "struct root_hash has invalid size, check your compiler options");
 static_assert(std::is_standard_layout<hash>::value, "struct hash is not a POD, check your compiler options");
+static_assert(std::is_standard_layout<root_hash>::value, "struct root_hash is not a POD, check your compiler options");
 
 struct
 #ifdef __GNUC__
@@ -197,8 +218,9 @@ struct
 #endif
 	difficulty_type
 {
-	FORCEINLINE constexpr difficulty_type() : lo(0), hi(0) {}
-	FORCEINLINE constexpr difficulty_type(uint64_t a, uint64_t b) : lo(a), hi(b) {}
+	FORCEINLINE          constexpr difficulty_type() noexcept : lo(0), hi(0) {}
+	FORCEINLINE explicit constexpr difficulty_type(uint64_t a) noexcept : lo(a), hi(0) {}
+	FORCEINLINE          constexpr difficulty_type(uint64_t a, uint64_t b) noexcept : lo(a), hi(b) {}
 
 	uint64_t lo;
 	uint64_t hi;
@@ -370,6 +392,19 @@ struct TxMempoolData
 	uint64_t time_received;
 };
 
+struct AuxChainData
+{
+	FORCEINLINE AuxChainData(const hash& _id, const hash& _data, const difficulty_type& _difficulty) : unique_id(_id), data(_data), difficulty(_difficulty) {}
+
+	FORCEINLINE bool operator==(const AuxChainData& rhs) const {
+		return (unique_id == rhs.unique_id) && (data == rhs.data) && (difficulty == rhs.difficulty);
+	}
+
+	hash unique_id;
+	hash data;
+	difficulty_type difficulty;
+};
+
 struct MinerData
 {
 	FORCEINLINE MinerData()
@@ -381,6 +416,7 @@ struct MinerData
 		, median_weight(0)
 		, already_generated_coins(0)
 		, median_timestamp(0)
+		, aux_nonce(0)
 	{}
 
 	uint8_t major_version;
@@ -392,6 +428,9 @@ struct MinerData
 	uint64_t already_generated_coins;
 	uint64_t median_timestamp;
 	std::vector<TxMempoolData> tx_backlog;
+
+	std::vector<AuxChainData> aux_chains;
+	uint32_t aux_nonce;
 
 	std::chrono::high_resolution_clock::time_point time_received;
 };

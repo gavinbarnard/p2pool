@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -100,6 +100,7 @@ SideChain::SideChain(p2pool* pool, NetworkType type, const char* pool_name)
 	LOGINFO(1, "generating consensus ID");
 
 	char buf[log::Stream::BUF_SIZE + 1];
+	// cppcheck-suppress uninitvar
 	log::Stream s(buf);
 
 	s << s_networkType     << '\0'
@@ -114,11 +115,11 @@ SideChain::SideChain(p2pool* pool, NetworkType type, const char* pool_name)
 	constexpr char mini_config[] = "mainnet\0" "mini\0" "\0" "10\0" "100000\0" "2160\0" "20\0";
 
 	// Hardcoded default consensus ID
-	if (memcmp(buf, default_config, sizeof(default_config) - 1) == 0) {
+	if ((s.m_pos == sizeof(default_config) - 1) && (memcmp(buf, default_config, sizeof(default_config) - 1) == 0)) {
 		m_consensusId.assign(default_consensus_id, default_consensus_id + HASH_SIZE);
 	}
 	// Hardcoded mini consensus ID
-	else if (memcmp(buf, mini_config, sizeof(mini_config) - 1) == 0) {
+	else if ((s.m_pos == sizeof(mini_config) - 1) && (memcmp(buf, mini_config, sizeof(mini_config) - 1) == 0)) {
 		m_consensusId.assign(mini_consensus_id, mini_consensus_id + HASH_SIZE);
 	}
 	else {
@@ -236,7 +237,9 @@ void SideChain::fill_sidechain_data(PoolBlock& block, std::vector<MinerShare>& s
 		block.m_txkeySecSeed = m_consensusHash;
 		get_tx_keys(block.m_txkeyPub, block.m_txkeySec, block.m_txkeySecSeed, block.m_prevId);
 
-		get_shares(&block, shares);
+		if (!get_shares(&block, shares)) {
+			LOGERR(6, "fill_sidechain_data: get_shares failed");
+		}
 		return;
 	}
 
@@ -330,7 +333,9 @@ void SideChain::fill_sidechain_data(PoolBlock& block, std::vector<MinerShare>& s
 		block.m_cumulativeDifficulty += it->second->m_difficulty;
 	}
 
-	get_shares(&block, shares);
+	if (!get_shares(&block, shares)) {
+		LOGERR(6, "fill_sidechain_data: get_shares failed");
+	}
 }
 
 P2PServer* SideChain::p2pServer() const
@@ -635,13 +640,13 @@ bool SideChain::add_external_block(PoolBlock& block, std::vector<hash>& missing_
 			}
 		}
 
-		if (block.m_sidechainId == m_watchBlockSidechainId) {
+		if (block.m_merkleRoot == m_watchBlockMerkleRoot) {
 			const Wallet& w = m_pool->params().m_wallet;
 
 			const char* who = (block.m_minerWallet == w) ? "you" : "someone else in this p2pool";
 			LOGINFO(0, log::LightGreen() << "BLOCK FOUND: main chain block at height " << m_watchBlock.height << " was mined by " << who << BLOCK_FOUND);
 
-			m_watchBlockSidechainId = {};
+			m_watchBlockMerkleRoot = {};
 			data = m_watchBlock;
 			block_found = true;
 
@@ -659,8 +664,7 @@ bool SideChain::add_external_block(PoolBlock& block, std::vector<hash>& missing_
 		m_pool->api_update_block_found(&data, &block);
 	}
 
-	add_block(block);
-	return true;
+	return add_block(block);
 }
 
 bool SideChain::add_block(const PoolBlock& block)
@@ -701,6 +705,7 @@ bool SideChain::add_block(const PoolBlock& block)
 	}
 
 	m_blocksByHeight[new_block->m_sidechainHeight].push_back(new_block);
+	m_blocksByMerkleRoot.insert({ new_block->m_merkleRoot, new_block });
 
 	update_depths(new_block);
 
@@ -733,11 +738,23 @@ PoolBlock* SideChain::find_block(const hash& id) const
 	return nullptr;
 }
 
-void SideChain::watch_mainchain_block(const ChainMain& data, const hash& possible_id)
+PoolBlock* SideChain::find_block_by_merkle_root(const root_hash& merkle_root) const
+{
+	ReadLock lock(m_sidechainLock);
+
+	auto it = m_blocksByMerkleRoot.find(merkle_root);
+	if (it != m_blocksByMerkleRoot.end()) {
+		return it->second;
+	}
+
+	return nullptr;
+}
+
+void SideChain::watch_mainchain_block(const ChainMain& data, const hash& possible_merkle_root)
 {
 	WriteLock lock(m_sidechainLock);
 	m_watchBlock = data;
-	m_watchBlockSidechainId = possible_id;
+	m_watchBlockMerkleRoot = possible_merkle_root;
 }
 
 const PoolBlock* SideChain::get_block_blob(const hash& id, std::vector<uint8_t>& blob) const
@@ -794,7 +811,7 @@ bool SideChain::get_outputs_blob(PoolBlock* block, uint64_t total_reward, std::v
 	{
 		ReadLock lock(m_sidechainLock);
 
-		auto it = m_blocksById.find(block->m_sidechainId);
+		auto it = block->m_sidechainId.empty() ? m_blocksById.end() : m_blocksById.find(block->m_sidechainId);
 		if (it != m_blocksById.end()) {
 			PoolBlock* b = it->second;
 			const size_t n = b->m_outputs.size();
@@ -914,7 +931,9 @@ void SideChain::print_status(bool obtain_sidechain_lock) const
 	std::vector<MinerShare> shares;
 	uint64_t bh = 0;
 	if (tip) {
-		get_shares(tip, shares, &bh, true);
+		if (!get_shares(tip, shares, &bh, true)) {
+			LOGERR(6, "print_status: get_shares failed");
+		}
 	}
 
 	const uint64_t window_size = (tip && bh) ? (tip->m_sidechainHeight - bh + 1U) : m_chainWindowSize;
@@ -1423,12 +1442,34 @@ bool SideChain::get_difficulty(const PoolBlock* tip, std::vector<DifficultyData>
 	return true;
 }
 
+bool SideChain::p2pool_update_available() const
+{
+	difficulty_type total_p2pool_diff, newer_p2pool_diff;
+	{
+		ReadLock lock(m_sidechainLock);
+
+		const PoolBlock* cur = m_chainTip;
+
+		for (uint64_t i = 0; (i < m_chainWindowSize) && cur; ++i, cur = get_parent(cur)) {
+			if (cur->m_sidechainExtraBuf[0] == static_cast<uint32_t>(SoftwareID::P2Pool)) {
+				total_p2pool_diff += cur->m_difficulty;
+				if (cur->m_sidechainExtraBuf[1] > P2POOL_VERSION) {
+					newer_p2pool_diff += cur->m_difficulty;
+				}
+			}
+		}
+	}
+
+	// Assume that a new version is out if >= 20% of hashrate is using it already
+	return newer_p2pool_diff * 5 >= total_p2pool_diff;
+}
+
 void SideChain::verify_loop(PoolBlock* block)
 {
 	// PoW is already checked at this point
 
 	std::vector<PoolBlock*> blocks_to_verify(1, block);
-	PoolBlock* highest_block = nullptr;
+	const PoolBlock* highest_block = nullptr;
 
 	while (!blocks_to_verify.empty()) {
 		block = blocks_to_verify.back();
@@ -1663,7 +1704,7 @@ void SideChain::verify(PoolBlock* block)
 		}
 
 		// Check that uncle and parent have the same ancestor (they must be on the same chain)
-		PoolBlock* tmp = parent;
+		const PoolBlock* tmp = parent;
 		while (tmp->m_sidechainHeight > uncle->m_sidechainHeight) {
 			tmp = get_parent(tmp);
 			if (!tmp) {
@@ -1686,7 +1727,7 @@ void SideChain::verify(PoolBlock* block)
 		}
 
 		bool same_chain = false;
-		PoolBlock* tmp2 = uncle;
+		const PoolBlock* tmp2 = uncle;
 		for (size_t j = 0; (j < UNCLE_BLOCK_DEPTH) && tmp && tmp2 && (tmp->m_sidechainHeight + UNCLE_BLOCK_DEPTH >= block->m_sidechainHeight); ++j) {
 			if (tmp->m_parent == tmp2->m_parent) {
 				same_chain = true;
@@ -2180,25 +2221,33 @@ void SideChain::prune_old_blocks()
 
 	const uint64_t h = tip->m_sidechainHeight - prune_distance;
 
-	uint64_t num_blocks_pruned = 0;
+	std::vector<PoolBlock*> blocks_to_prune;
 
 	for (auto it = m_blocksByHeight.begin(); (it != m_blocksByHeight.end()) && (it->first <= h);) {
 		const uint64_t height = it->first;
 		std::vector<PoolBlock*>& v = it->second;
 
 		v.erase(std::remove_if(v.begin(), v.end(),
-			[this, prune_distance, cur_time, prune_delay, &num_blocks_pruned, height](PoolBlock* block)
+			[this, prune_distance, cur_time, prune_delay, &blocks_to_prune, height](PoolBlock* block)
 			{
 				if ((block->m_depth >= prune_distance) || (cur_time >= block->m_localTimestamp + prune_delay)) {
 					auto it2 = m_blocksById.find(block->m_sidechainId);
 					if (it2 != m_blocksById.end()) {
 						m_blocksById.erase(it2);
-						delete block;
-						++num_blocks_pruned;
+						blocks_to_prune.push_back(block);
 					}
 					else {
 						LOGERR(1, "m_blocksByHeight and m_blocksById are inconsistent at height " << height << ". Fix the code!");
 					}
+
+					auto it3 = m_blocksByMerkleRoot.find(block->m_merkleRoot);
+					if (it3 != m_blocksByMerkleRoot.end()) {
+						m_blocksByMerkleRoot.erase(it3);
+					}
+					else {
+						LOGERR(1, "m_blocksByHeight and m_blocksByMerkleRoot are inconsistent at height " << height << ". Fix the code!");
+					}
+
 					return true;
 				}
 				return false;
@@ -2212,8 +2261,8 @@ void SideChain::prune_old_blocks()
 		}
 	}
 
-	if (num_blocks_pruned) {
-		LOGINFO(4, "pruned " << num_blocks_pruned << " old blocks at heights <= " << h);
+	if (!blocks_to_prune.empty()) {
+		LOGINFO(4, "pruned " << blocks_to_prune.size() << " old blocks at heights <= " << h);
 
 		// If side-chain started pruning blocks it means the initial sync is complete
 		// It's now safe to delete cached blocks
@@ -2223,6 +2272,11 @@ void SideChain::prune_old_blocks()
 
 		// Pre-calc workers are not needed anymore
 		finish_precalc();
+
+		// We can only delete old blocks after the precalc is stopped because it can still use some of them
+		for (const PoolBlock* b : blocks_to_prune) {
+			delete b;
+		}
 
 #ifdef DEV_TEST_SYNC
 		if (m_firstPruneTime == 0) {
@@ -2237,15 +2291,10 @@ void SideChain::prune_old_blocks()
 #ifdef DEV_TRACK_MEMORY
 			show_top_10_allocations();
 #endif
-			print_status(false);
-
 			StratumServer* server1 = m_pool->stratum_server();
 			P2PServer* server2 = m_pool->p2p_server();
 
 			if (server1 && server2) {
-				server1->print_status();
-				server2->print_status();
-
 				server1->print_bans();
 				server2->print_bans();
 
@@ -2254,7 +2303,6 @@ void SideChain::prune_old_blocks()
 			}
 
 			m_pool->print_hosts();
-			bkg_jobs_tracker.print_status();
 			m_pool->stop();
 		}
 #endif
@@ -2408,8 +2456,8 @@ void SideChain::launch_precalc(const PoolBlock* block)
 				{
 					MutexLock lock2(m_precalcJobsMutex);
 					m_precalcJobs.push_back(job);
+					uv_cond_signal(&m_precalcJobsCond);
 				}
-				uv_cond_signal(&m_precalcJobsCond);
 			}
 		}
 	}

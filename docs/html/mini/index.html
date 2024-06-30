@@ -80,16 +80,22 @@ async function load_data() {
 	let pool_stats_req = await fetch('api/pool/stats');
 	let pool_blocks_req = await fetch('api/pool/blocks');
 	let network_stats_req = await fetch('api/network/stats');
+	let latest_release_req = await fetch('api/latest_release');
+
 	let pool_stats = JSON.parse(await pool_stats_req.text());
 	let pool_blocks = JSON.parse(await pool_blocks_req.text());
 	let network_stats = JSON.parse(await network_stats_req.text());
+	let latest_release = JSON.parse(await latest_release_req.text());
 
 	let pool_hashrate = pool_stats.pool_statistics.hashRate / 1e6;
 	let pplns_duration = pool_stats.pool_statistics.pplnsWeight / pool_stats.pool_statistics.hashRate;
+	let min_payout = 0.6 * pool_stats.pool_statistics.sidechainDifficulty / pool_stats.pool_statistics.pplnsWeight;
 
 	document.getElementById("pool_hashrate").innerHTML = pool_hashrate.toFixed(3) + ' MH/s';
 	document.getElementById("pplns_duration").innerHTML = elapsedTimeStr(0, pplns_duration, 0) + ' ' + Math.floor(pplns_duration % 60) + 's';
 	document.getElementById("pool_miners").innerHTML = pool_stats.pool_statistics.miners;
+	document.getElementById("min_payout").innerHTML = min_payout.toFixed(5) + ' XMR';
+	document.getElementById("latest_release").innerHTML = '<a href="' + latest_release.html_url + '" target="_blank">' + latest_release.name + '</a>';
 
 	let ts = Math.floor(Date.now() / 1000);
 
@@ -188,6 +194,7 @@ function toggle_menu(name) {
 </head>
 <body onload="load_data();setInterval(load_data, 2000);toggle_menu(window.location.hash.substr(1));">
 <div style="font-size:3rem;text-align:center;">P2Pool mini</div><div style="font-size:1.1rem;text-align:center;">Decentralized Monero mining pool</div>
+<div style="font-size:1rem;text-align:center;">Latest release: <span id="latest_release"><a href="https://github.com/SChernykh/p2pool/releases/latest" target="_blank">P2Pool</a></span></div>
 <br>
 <table id="main_menu" style="width:100%;margin-left:auto;margin-right:auto;table-layout:fixed;text-align:center;-ms-touch-action:none;touch-action:none;"><tr>
 <td onclick="toggle_menu('pool')" id="button_pool">Pool</td>
@@ -208,7 +215,7 @@ function toggle_menu(name) {
 <tr><td>Average effort<br><div style="text-align:center;font-size:0.9rem">last 50 blocks</div></td><td><span id="average_effort">N/A</span></td><td></td></tr>
 <tr><td>&nbsp;</td><td></td><td></td></tr>
 <tr><td>Fee</td><td>0%</td><td></td></tr>
-<tr><td>Min payout</td><td>0.0003 XMR</td><td></td></tr>
+<tr><td>Min payout</td><td><span id="min_payout">0.00027 XMR</span></td><td></td></tr>
 <tr><td>Payout scheme</td><td><a href="https://en.wikipedia.org/wiki/Mining_pool#Pay-per-last-N-shares" target="_blank">PPLNS</a></td><td></td></tr>
 <tr><td>&nbsp;</td><td></td><td></td></tr>
 <tr><td>Statistics</td><td><a href="https://mini.p2pool.observer/" target="_blank">P2Pool observer</a></td><td></td></tr>
@@ -241,8 +248,8 @@ It's highly recommended to create a new wallet for mining because wallet address
 <ul>
 <li>Download the latest Monero <a href="https://www.getmonero.org/downloads/" target="_blank">release</a>
 <li>[Optional] Open port <span>18080</span> (Monero p2p port) in your firewall to ensure better connectivity
-<li>Run <span>./monerod --zmq-pub tcp://127.0.0.1:18083 --out-peers 64 --in-peers 32 --add-priority-node=p2pmd.xmrvsbeast.com:18080 --add-priority-node=nodes.hashvault.pro:18080 --disable-dns-checkpoints --enable-dns-blocklist</span>
-<li>If your network connection's upload bandwidth is less than 10 Mbit, use <span>--out-peers 16 --in-peers 8</span> instead.
+<li>Run <span>./monerod --zmq-pub tcp://127.0.0.1:18083 --out-peers 32 --in-peers 64 --add-priority-node=p2pmd.xmrvsbeast.com:18080 --add-priority-node=nodes.hashvault.pro:18080 --disable-dns-checkpoints --enable-dns-blocklist</span>
+<li>If your network connection's upload bandwidth is less than 10 Mbit, use <span>--out-peers 8 --in-peers 16</span> instead.
 <li>Wait until it's fully synchronized. If you didn't run Monero node before, it can take up to several days to synchronize (5-6 hours on a modern PC with fast SSD and fast Internet connection). You can add <span>--prune-blockchain</span> argument to the command line to run a pruned node (3-4 times less disk usage)
 </ul></details>
 
@@ -260,6 +267,7 @@ It's highly recommended to create a new wallet for mining because wallet address
 <li>Once P2Pool sync is complete, XMRig should be able to connect to the stratum server on port <span>3333</span>
 <li>Run <span>./xmrig -o 127.0.0.1:3333</span>. Note that you don't need to specify wallet address for xmrig. Wallet address set in xmrig config will be ignored!
 <li>To set custom fixed difficulty for your miner (for example, <span>10000</span>), run <span>./xmrig -u x+10000 -o 127.0.0.1:3333</span>
+<li>To connect another mining rig to your P2Pool node, run <span>./xmrig -o YOUR_P2POOL_NODE_IP:3333</span> on that mining rig
 </ul></details>
 
 <details><summary>Checking your progress</summary>

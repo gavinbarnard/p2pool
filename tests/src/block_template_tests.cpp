@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -64,11 +64,11 @@ TEST(block_template, update)
 
 	std::vector<uint8_t> blobs;
 	uint64_t height;
-	difficulty_type diff, sidechain_diff;
+	difficulty_type diff, aux_diff, sidechain_diff;
 	hash seed_hash;
 	size_t nonce_offset;
 	uint32_t template_id;
-	tpl.get_hashing_blobs(0, 10000, blobs, height, diff, sidechain_diff, seed_hash, nonce_offset, template_id);
+	tpl.get_hashing_blobs(0, 10000, blobs, height, diff, aux_diff, sidechain_diff, seed_hash, nonce_offset, template_id);
 
 	ASSERT_EQ(height, 2762973);
 	ASSERT_EQ(diff, 300346053753ULL);
@@ -99,7 +99,7 @@ TEST(block_template, update)
 		ASSERT_GE(*reinterpret_cast<const uint64_t*>(b->m_transactions[i].h), 256);
 	}
 
-	tpl.get_hashing_blobs(0, 10000, blobs, height, diff, sidechain_diff, seed_hash, nonce_offset, template_id);
+	tpl.get_hashing_blobs(0, 10000, blobs, height, diff, aux_diff, sidechain_diff, seed_hash, nonce_offset, template_id);
 
 	ASSERT_EQ(height, 2762973);
 	ASSERT_EQ(diff, 300346053753ULL);

@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -22,6 +22,7 @@
 #include <fstream>
 #include <thread>
 #include <stdlib.h>
+#include <clocale>
 
 #ifdef _MSC_VER
 #pragma warning(disable : 4996)
@@ -43,15 +44,73 @@ bool CONSOLE_COLORS = true;
 #ifdef _WIN32
 static const HANDLE hStdIn  = GetStdHandle(STD_INPUT_HANDLE);
 static const HANDLE hStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
-static const HANDLE hStdErr = GetStdHandle(STD_ERROR_HANDLE);
-#endif
+
+#if defined(_MSC_VER) && !defined(NDEBUG)
+
+#include <DbgHelp.h>
+
+#pragma comment(lib, "Dbghelp.lib")
+
+LONG WINAPI UnhandledExceptionFilter(_In_ _EXCEPTION_POINTERS* exception_pointers)
+{
+	constexpr size_t MAX_FRAMES = 32;
+
+	void* stack_trace[MAX_FRAMES] = {};
+	DWORD hash;
+	CaptureStackBackTrace(1, MAX_FRAMES, stack_trace, &hash);
+
+	char buffer[sizeof(SYMBOL_INFO) + MAX_SYM_NAME * sizeof(TCHAR)] = {};
+	PSYMBOL_INFO pSymbol = reinterpret_cast<PSYMBOL_INFO>(buffer);
+
+	pSymbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+	pSymbol->MaxNameLen = MAX_SYM_NAME;
+
+	IMAGEHLP_LINE64 line{};
+	line.SizeOfStruct = sizeof(IMAGEHLP_LINE64);
+
+	const HANDLE h = GetCurrentProcess();
+
+	const uint32_t code = (exception_pointers && exception_pointers->ExceptionRecord) ? exception_pointers->ExceptionRecord->ExceptionCode : 0;
+
+	fprintf(stderr, "\n\nUnhandled exception %X at:\n", code);
+	fflush(stderr);
+
+	for (size_t j = 0; j < MAX_FRAMES; ++j) {
+		const DWORD64 address = reinterpret_cast<DWORD64>(stack_trace[j]);
+		DWORD t = 0;
+		if (SymFromAddr(h, address, nullptr, pSymbol) && SymGetLineFromAddr64(h, address, &t, &line)) {
+			fprintf(stderr, "%s (%s, line %lu)\n", line.FileName, pSymbol->Name, line.LineNumber);
+			fflush(stderr);
+		}
+	}
+
+	fprintf(stderr, "\n\n");
+	fflush(stderr);
+
+	// Normal logging might be broken at this point, but try to log it anyway
+	LOGERR(0, "Unhandled exception " << log::Hex(code) << " at:");
+
+	for (size_t j = 0; j < MAX_FRAMES; ++j) {
+		const DWORD64 address = reinterpret_cast<DWORD64>(stack_trace[j]);
+		DWORD t = 0;
+		if (SymFromAddr(h, address, nullptr, pSymbol) && SymGetLineFromAddr64(h, address, &t, &line)) {
+			LOGERR(0, line.FileName << " (" << static_cast<const char*>(pSymbol->Name) << ", line " << static_cast<size_t>(line.LineNumber) << ')');
+		}
+	}
+
+	Sleep(1000);
+
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif // _MSC_VER && !NDEBUG
+#endif // _WIN32
 
 class Worker
 {
 public:
 	enum params : int
 	{
-		SLOT_SIZE = 1024,
+		SLOT_SIZE = log::Stream::BUF_SIZE + 1,
 		BUF_SIZE = SLOT_SIZE * 8192,
 	};
 
@@ -61,7 +120,14 @@ public:
 		, m_started{ false }
 		, m_stopped(false)
 	{
+#if defined(_WIN32) && defined(_MSC_VER) && !defined(NDEBUG)
+		SetUnhandledExceptionFilter(UnhandledExceptionFilter);
+		SymInitialize(GetCurrentProcess(), NULL, TRUE);
+#endif
+
 		set_main_thread();
+
+		std::setlocale(LC_ALL, "en_001");
 
 		m_logFile.open(log_file_name, std::ios::app | std::ios::binary);
 
@@ -137,6 +203,10 @@ public:
 #endif
 
 		m_logFile.close();
+
+#if defined(_WIN32) && defined(_MSC_VER) && !defined(NDEBUG)
+		SymCleanup(GetCurrentProcess());
+#endif
 	}
 
 	FORCEINLINE void write(const char* buf, uint32_t size)
@@ -242,12 +312,7 @@ private:
 							strip_colors(p, size);
 						}
 
-#ifdef _WIN32
-						DWORD k;
-						WriteConsole((severity == 1) ? hStdOut : hStdErr, p, size, &k, nullptr);
-#else
 						fwrite(p, 1, size, (severity == 1) ? stdout : stderr);
-#endif
 
 						if (m_logFile.is_open()) {
 							if (c) {
@@ -286,6 +351,9 @@ private:
 					m_logFile.open(log_file_name, std::ios::app | std::ios::binary);
 				}
 			}
+
+			fflush(stdout);
+			fflush(stderr);
 		} while (1);
 	}
 

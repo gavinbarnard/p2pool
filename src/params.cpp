@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -189,6 +189,12 @@ Params::Params(int argc, char* const argv[])
 		}
 #endif
 
+		if ((strcmp(argv[i], "--merge-mine") == 0) && (i + 2 < argc)) {
+			m_mergeMiningHosts.emplace_back(argv[i + 1], argv[i + 2]);
+			i += 2;
+			ok = true;
+		}
+
 		if (!ok) {
 			fprintf(stderr, "Unknown command line parameter %s\n\n", argv[i]);
 			p2pool_usage();
@@ -226,6 +232,11 @@ bool Params::valid() const
 {
 	if (!m_wallet.valid()) {
 		LOGERR(1, "Invalid wallet address. Try \"p2pool --help\".");
+		return false;
+	}
+
+	if (m_mergeMiningHosts.size() > 10) {
+		LOGERR(1, "Too many merge mining blockchains.");
 		return false;
 	}
 

@@ -1,11 +1,22 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.10)
 project(p2pool)
+
+include(cmake/standard.cmake)
+
+message(STATUS "Build environment:
+    System processor: ${CMAKE_SYSTEM_PROCESSOR}
+    C compiler:       ${CMAKE_C_COMPILER} (${CMAKE_C_COMPILER_ID})
+    CXX compiler:     ${CMAKE_CXX_COMPILER} (${CMAKE_CXX_COMPILER_ID})
+")
+
+set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
 option(STATIC_BINARY "Build static binary" OFF)
 option(STATIC_LIBS "Link libuv and libzmq statically" OFF)
 option(WITH_RANDOMX "Include the RandomX library in the build. If this is turned off, p2pool will rely on monerod for verifying RandomX hashes" ON)
 option(WITH_LTO "Use link-time compiler optimization (if linking fails for you, run cmake with -DWITH_LTO=OFF)" ON)
 option(WITH_UPNP "Include UPnP support. If this is turned off, p2pool will not be able to configure port forwarding on UPnP-enabled routers." ON)
+option(WITH_GRPC "Include gRPC support. If this is turned off, p2pool will not be able to merge mine with Tari." ON)
 
 option(DEV_TEST_SYNC "[Developer only] Sync test, stop p2pool after sync is complete" OFF)
 option(DEV_WITH_TSAN "[Developer only] Compile with thread sanitizer" OFF)
@@ -15,10 +26,17 @@ option(DEV_WITH_ASAN "[Developer only] Compile with address sanitizer" OFF)
 option(DEV_CLANG_TIDY "[Developer only] Compile for clang-tidy" OFF)
 option(DEV_TRACK_MEMORY "[Developer only] Track memory allocations" OFF)
 
-set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake")
+set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT p2pool)
 
-if (${CMAKE_VERSION} VERSION_GREATER "3.5.2") 
-	set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT p2pool)
+if (CMAKE_CXX_COMPILER_ID MATCHES MSVC)
+	set(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION 10.0)
+endif()
+
+if (WITH_GRPC)
+	add_definitions(-DWITH_GRPC)
+	include(cmake/grpc.cmake)
+
+	add_subdirectory(external/src/Tari)
 endif()
 
 if (WITH_RANDOMX)
@@ -64,6 +82,7 @@ endif()
 include(cmake/flags.cmake)
 
 set(HEADERS
+	external/src/crypto/sha256.h
 	external/src/cryptonote/crypto-ops.h
 	external/src/hardforks/hardforks.h
 	src/block_cache.h
@@ -76,6 +95,9 @@ set(HEADERS
 	src/keccak.h
 	src/log.h
 	src/mempool.h
+	src/merge_mining_client.h
+	src/merge_mining_client_json_rpc.h
+	src/merkle.h
 	src/p2p_server.h
 	src/p2pool.h
 	src/p2pool_api.h
@@ -93,6 +115,7 @@ set(HEADERS
 )
 
 set(SOURCES
+	external/src/crypto/sha256.c
 	external/src/cryptonote/crypto-ops-data.c
 	external/src/cryptonote/crypto-ops.c
 	external/src/hardforks/hardforks.cpp
@@ -106,6 +129,9 @@ set(SOURCES
 	src/main.cpp
 	src/memory_leak_debug.cpp
 	src/mempool.cpp
+	src/merge_mining_client.cpp
+	src/merge_mining_client_json_rpc.cpp
+	src/merkle.cpp
 	src/p2p_server.cpp
 	src/p2pool.cpp
 	src/p2pool_api.cpp
@@ -120,10 +146,28 @@ set(SOURCES
 	src/zmq_reader.cpp
 )
 
+if (AMD64)
+	set(SOURCES ${SOURCES} src/keccak_bmi.cpp)
+	if (CMAKE_C_COMPILER_ID MATCHES GNU OR CMAKE_C_COMPILER_ID MATCHES Clang)
+		set_source_files_properties(src/keccak_bmi.cpp PROPERTIES COMPILE_FLAGS "${CMAKE_CXX_FLAGS} -mbmi")
+	endif()
+endif()
+
 if (WITH_RANDOMX)
 	set(HEADERS ${HEADERS} src/miner.h)
 	set(SOURCES ${SOURCES} src/miner.cpp)
+else()
+	set(HEADERS ${HEADERS} external/src/RandomX/src/cpu.hpp)
+	set(SOURCES ${SOURCES} external/src/RandomX/src/cpu.cpp)
 endif()
+
+if (WITH_GRPC)
+	set(HEADERS ${HEADERS} src/merge_mining_client_tari.h)
+	set(SOURCES ${SOURCES} src/merge_mining_client_tari.cpp)
+endif()
+
+source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" PREFIX "Header Files" FILES ${HEADERS})
+source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" PREFIX "Source Files" FILES ${SOURCES})
 
 if (NOT ((CMAKE_CXX_COMPILER_ID MATCHES MSVC) OR STATIC_BINARY OR STATIC_LIBS))
 	include(FindCURL)
@@ -145,6 +189,7 @@ endif()
 
 include_directories(src)
 include_directories(external/src)
+include_directories(external/src/crypto)
 include_directories(external/src/cryptonote)
 include_directories(${UV_INCLUDE_DIR})
 include_directories(external/src/cppzmq)
@@ -164,6 +209,8 @@ if (WIN32)
 		set(LIBS ${LIBS} bcrypt)
 	endif()
 	add_definitions(-DCURL_STATICLIB)
+	add_definitions(-DWIN32_LEAN_AND_MEAN)
+	add_definitions(-D_WIN32_WINNT=0x0600)
 elseif (CMAKE_SYSTEM_NAME STREQUAL FreeBSD)
 	set(LIBS ${LIBS} pthread)
 elseif (NOT APPLE)
@@ -171,8 +218,8 @@ elseif (NOT APPLE)
 endif()
 
 if (CMAKE_CXX_COMPILER_ID MATCHES MSVC)
-	find_library(ZMQ_LIBRARY_DEBUG NAMES libzmq-v142-mt-sgd-4_3_5 PATHS "external/lib/libzmq/Debug")
-	find_library(ZMQ_LIBRARY NAMES libzmq-v142-mt-s-4_3_5 PATHS "external/lib/libzmq/Release")
+	find_library(ZMQ_LIBRARY_DEBUG NAMES libzmq-v142-mt-sgd-4_3_6 PATHS "external/lib/libzmq/Debug")
+	find_library(ZMQ_LIBRARY NAMES libzmq-v142-mt-s-4_3_6 PATHS "external/lib/libzmq/Release")
 	find_library(UV_LIBRARY_DEBUG NAMES libuv PATHS "external/lib/libuv/Debug")
 	find_library(UV_LIBRARY NAMES libuv PATHS "external/lib/libuv/Release")
 	find_library(CURL_LIBRARY_DEBUG NAMES libcurl-d PATHS "external/lib/libcurl/Debug")
@@ -185,8 +232,8 @@ elseif (CMAKE_CXX_COMPILER_ID MATCHES GNU OR CMAKE_CXX_COMPILER_ID MATCHES Clang
 	find_library(UV_LIBRARY_DEBUG NAMES uv libuv.a)
 	find_library(UV_LIBRARY NAMES uv libuv.a)
 	if (WIN32)
-		find_library(CURL_LIBRARY_DEBUG NAMES libcurl.a PATHS "external/src/curl/lib/.libs" NO_DEFAULT_PATH)
-		find_library(CURL_LIBRARY NAMES libcurl.a PATHS "external/src/curl/lib/.libs" NO_DEFAULT_PATH)
+		find_library(CURL_LIBRARY_DEBUG NAMES libcurl.a PATHS "external/src/curl/lib" NO_DEFAULT_PATH)
+		find_library(CURL_LIBRARY NAMES libcurl.a PATHS "external/src/curl/lib" NO_DEFAULT_PATH)
 	else()
 		if (CURL_LIBRARIES)
 			set(CURL_LIBRARY_DEBUG ${CURL_LIBRARIES})
@@ -223,10 +270,17 @@ endif()
 
 add_definitions(/DZMQ_STATIC)
 
+include(CheckIncludeFile)
+
+check_include_file(asm/hwcap.h HAVE_HWCAP)
+if(HAVE_HWCAP)
+	add_definitions(/DHAVE_HWCAP)
+endif()
+
 include(CheckCXXSourceCompiles)
 
 check_cxx_source_compiles("int main(){ return __builtin_clzll(1);}" HAVE_BUILTIN_CLZLL)
-check_cxx_source_compiles("#include <intrin.h>\n#pragma intrinsic(_BitScanReverse64)\nint main(){unsigned long r;_BitScanReverse64(&r,1);return r;}" HAVE_BITSCANREVERSE64)
+check_cxx_source_compiles("#include <intrin.h>\n#pragma intrinsic(_BitScanReverse64)\nint main(){unsigned long r;_BitScanReverse64(&r,1);return static_cast<int>(r);}" HAVE_BITSCANREVERSE64)
 check_cxx_source_compiles("#include <sched.h>\nint main(){sched_param param;return sched_setscheduler(0, SCHED_IDLE, &param);}" HAVE_SCHED)
 
 include(CheckCSourceCompiles)
@@ -348,12 +402,27 @@ if (STATIC_BINARY OR STATIC_LIBS)
 		set(STATIC_LIBS ${STATIC_LIBS} resolv)
 	endif()
 
+	if (WITH_GRPC)
+		set(STATIC_LIBS ${STATIC_LIBS} Tari_gRPC grpc grpc++ libprotobuf)
+	endif()
+
 	target_link_libraries(${CMAKE_PROJECT_NAME}
 		"${CMAKE_SOURCE_DIR}/external/src/libzmq/build/lib/libzmq.a"
 		"${CMAKE_SOURCE_DIR}/external/src/libuv/build/libuv.a"
-		"${CMAKE_SOURCE_DIR}/external/src/curl/lib/.libs/libcurl.a"
+		"${CMAKE_SOURCE_DIR}/external/src/curl/lib/libcurl.a"
 		${STATIC_LIBS}
 	)
 else()
+	if (WITH_GRPC)
+		set(LIBS ${LIBS} Tari_gRPC grpc grpc++ libprotobuf)
+	endif()
+
 	target_link_libraries(${CMAKE_PROJECT_NAME} debug ${ZMQ_LIBRARY_DEBUG} debug ${UV_LIBRARY_DEBUG} debug ${CURL_LIBRARY_DEBUG} optimized ${ZMQ_LIBRARY} optimized ${UV_LIBRARY} optimized ${CURL_LIBRARY} ${LIBS})
 endif()
+
+message(STATUS "Summary of build options:
+    C compiler:      ${CMAKE_C_COMPILER} (${CMAKE_C_COMPILER_ID})
+    CXX compiler:    ${CMAKE_CXX_COMPILER} (${CMAKE_CXX_COMPILER_ID})
+    C_FLAGS:         ${CMAKE_C_FLAGS}
+    CXX_FLAGS:       ${CMAKE_CXX_FLAGS}
+")

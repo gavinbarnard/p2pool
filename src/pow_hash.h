@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -48,7 +48,7 @@ class RandomX_Hasher : public RandomX_Hasher_Base
 {
 public:
 	explicit RandomX_Hasher(p2pool* pool);
-	~RandomX_Hasher();
+	~RandomX_Hasher() override;
 
 	void set_seed_async(const hash& seed) override;
 	void set_seed(const hash& seed);
@@ -98,7 +98,7 @@ class RandomX_Hasher_RPC : public RandomX_Hasher_Base
 {
 public:
 	explicit RandomX_Hasher_RPC(p2pool* pool);
-	~RandomX_Hasher_RPC();
+	~RandomX_Hasher_RPC() override;
 
 	bool calculate(const void* data_ptr, size_t size, uint64_t height, const hash& seed, hash& h, bool force_light_mode) override;
 
@@ -115,13 +115,11 @@ private:
 	uv_cond_t m_cond;
 
 	uv_async_t m_shutdownAsync;
-	uv_async_t m_kickTheLoopAsync;
 
 	static void on_shutdown(uv_async_t* async)
 	{
 		RandomX_Hasher_RPC* server = reinterpret_cast<RandomX_Hasher_RPC*>(async->data);
 		uv_close(reinterpret_cast<uv_handle_t*>(&server->m_shutdownAsync), nullptr);
-		uv_close(reinterpret_cast<uv_handle_t*>(&server->m_kickTheLoopAsync), nullptr);
 
 		delete GetLoopUserData(&server->m_loop, false);
 	}

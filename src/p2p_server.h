@@ -1,6 +1,6 @@
 /*
  * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2023 SChernykh <https://github.com/SChernykh>
+ * Copyright (c) 2021-2024 SChernykh <https://github.com/SChernykh>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -59,7 +59,7 @@ public:
 	};
 
 	explicit P2PServer(p2pool *pool);
-	~P2PServer();
+	~P2PServer() override;
 
 	void add_cached_block(const PoolBlock& block);
 	void clear_cached_blocks();
@@ -72,14 +72,14 @@ public:
 	struct P2PClient : public Client
 	{
 		P2PClient();
-		~P2PClient();
+		~P2PClient() override;
 
 		static Client* allocate() { return new P2PClient(); }
 		virtual size_t size() const override { return sizeof(P2PClient); }
 
 		void reset() override;
-		bool on_connect() override;
-		bool on_read(char* data, uint32_t size) override;
+		[[nodiscard]] bool on_connect() override;
+		[[nodiscard]] bool on_read(char* data, uint32_t size) override;
 		void on_read_failed(int err) override;
 		void on_disconnected() override;
 
@@ -99,28 +99,26 @@ public:
 			CHALLENGE_DIFFICULTY = 10000,
 		};
 
-		bool send_handshake_challenge();
+		[[nodiscard]] bool send_handshake_challenge();
 		void send_handshake_solution(const uint8_t (&challenge)[CHALLENGE_SIZE]);
-		bool check_handshake_solution(const hash& solution, const uint8_t (&solution_salt)[CHALLENGE_SIZE]);
+		[[nodiscard]] bool check_handshake_solution(const hash& solution, const uint8_t (&solution_salt)[CHALLENGE_SIZE]);
 
-		bool on_handshake_challenge(const uint8_t* buf);
-		bool on_handshake_solution(const uint8_t* buf);
+		[[nodiscard]] bool on_handshake_challenge(const uint8_t* buf);
+		[[nodiscard]] bool on_handshake_solution(const uint8_t* buf);
 		void on_after_handshake(uint8_t* &p);
-		bool on_listen_port(const uint8_t* buf);
-		bool on_block_request(const uint8_t* buf);
-		bool on_block_response(const uint8_t* buf, uint32_t size, uint64_t expected_id);
-		bool on_block_broadcast(const uint8_t* buf, uint32_t size, bool compact);
-		bool on_peer_list_request(const uint8_t* buf);
+		[[nodiscard]] bool on_listen_port(const uint8_t* buf);
+		[[nodiscard]] bool on_block_request(const uint8_t* buf);
+		[[nodiscard]] bool on_block_response(const uint8_t* buf, uint32_t size, uint64_t expected_id);
+		[[nodiscard]] bool on_block_broadcast(const uint8_t* buf, uint32_t size, bool compact);
+		[[nodiscard]] bool on_peer_list_request(const uint8_t* buf);
 		void on_peer_list_response(const uint8_t* buf);
 		void on_block_notify(const uint8_t* buf);
 
-		bool handle_incoming_block_async(const PoolBlock* block, uint64_t max_time_delta = 0);
-		void handle_incoming_block(p2pool* pool, PoolBlock& block, const uint32_t reset_counter, bool is_v6, const raw_ip& addr, std::vector<hash>& missing_blocks);
-		void post_handle_incoming_block(const PoolBlock& block, const uint32_t reset_counter, std::vector<hash>& missing_blocks);
+		[[nodiscard]] bool handle_incoming_block_async(const PoolBlock* block, uint64_t max_time_delta = 0);
+		void handle_incoming_block(p2pool* pool, PoolBlock& block, std::vector<hash>& missing_blocks, bool& result);
+		void post_handle_incoming_block(p2pool* pool, const PoolBlock& block, const uint32_t reset_counter, bool is_v6, const raw_ip& addr, std::vector<hash>& missing_blocks, const bool result);
 
-		bool is_good() const { return m_handshakeComplete && !m_handshakeInvalid && (m_listenPort >= 0); }
-
-		const char* software_name() const;
+		[[nodiscard]] bool is_good() const { return m_handshakeComplete && !m_handshakeInvalid && (m_listenPort >= 0); }
 
 		alignas(8) char m_p2pReadBuf[P2P_BUF_SIZE];
 
@@ -142,7 +140,7 @@ public:
 
 		uint32_t m_protocolVersion;
 		uint32_t m_SoftwareVersion;
-		uint32_t m_SoftwareID;
+		SoftwareID m_SoftwareID;
 
 		int64_t m_pingTime;
 
@@ -154,31 +152,42 @@ public:
 
 		hash m_broadcastedHashes[8];
 		uint32_t m_broadcastedHashesIndex;
+
+		// log::Stream wrapper
+		struct SoftwareDisplayName
+		{
+			FORCEINLINE SoftwareDisplayName(SoftwareID id, uint32_t version) : m_id(id), m_version(version) {}
+
+			SoftwareID m_id;
+			uint32_t m_version;
+		};
 	};
 
 	void broadcast(const PoolBlock& block, const PoolBlock* parent);
-	uint64_t get_random64();
-	uint64_t get_peerId() const { return m_peerId; }
+	[[nodiscard]] uint64_t get_random64();
+	[[nodiscard]] uint64_t get_peerId() const { return m_peerId; }
 
 	void print_status() override;
 	void show_peers_async();
-	size_t peer_list_size() const { MutexLock lock(m_peerListLock); return m_peerList.size(); }
+	[[nodiscard]] size_t peer_list_size() const { MutexLock lock(m_peerListLock); return m_peerList.size(); }
 
-	int external_listen_port() const override;
+	[[nodiscard]] int external_listen_port() const override;
 
-	uint32_t max_outgoing_peers() const { return m_maxOutgoingPeers; }
-	uint32_t max_incoming_peers() const { return m_maxIncomingPeers; }
+	[[nodiscard]] uint32_t max_outgoing_peers() const { return m_maxOutgoingPeers; }
+	[[nodiscard]] uint32_t max_incoming_peers() const { return m_maxIncomingPeers; }
 
 	void set_max_outgoing_peers(uint32_t n) { m_maxOutgoingPeers = std::min(std::max(n, 10U), 450U); }
 	void set_max_incoming_peers(uint32_t n) { m_maxIncomingPeers = std::min(std::max(n, 10U), 450U); }
 
-	int deserialize_block(const uint8_t* buf, uint32_t size, bool compact, uint64_t received_timestamp);
-	const PoolBlock* get_block() const { return m_block; }
+	[[nodiscard]] int deserialize_block(const uint8_t* buf, uint32_t size, bool compact, uint64_t received_timestamp);
+	[[nodiscard]] const PoolBlock* get_block() const { return m_block; }
 
-	const PoolBlock* find_block(const hash& id) const;
+	[[nodiscard]] const PoolBlock* find_block(const hash& id) const;
+
+	void check_for_updates(bool forced = false) const;
 
 private:
-	const char* get_log_category() const override;
+	[[nodiscard]] const char* get_log_category() const override;
 
 	p2pool* m_pool;
 	BlockCache* m_cache;
@@ -226,6 +235,8 @@ private:
 
 	struct Peer
 	{
+		void normalize();
+
 		bool m_isV6;
 		raw_ip m_addr;
 		int m_port;
@@ -257,6 +268,7 @@ private:
 	unordered_set<uint64_t> m_blockNotifyRequests;
 
 	P2PClient* m_fastestPeer;
+	std::atomic<bool> m_newP2PoolVersionDetected;
 
 	static void on_broadcast(uv_async_t* handle) { reinterpret_cast<P2PServer*>(handle->data)->on_broadcast(); }
 	void on_broadcast();
@@ -267,6 +279,7 @@ private:
 
 	static void on_connect_to_peers(uv_async_t* handle);
 
+	uv_mutex_t m_showPeersLock;
 	uv_async_t m_showPeersAsync;
 
 	static void on_show_peers(uv_async_t* handle) { reinterpret_cast<P2PServer*>(handle->data)->show_peers(); }

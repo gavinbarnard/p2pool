@@ -1,7 +1,10 @@
 cmake_minimum_required(VERSION 3.5)
 project(p2pool_tests)
 
+include(cmake/standard.cmake)
+
 option(STATIC_LIBS "Use locally built libuv and libzmq static libs" OFF)
+option(WITH_LTO "Use link-time compiler optimization (if linking fails for you, run cmake with -DWITH_LTO=OFF)" ON)
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake")
 
@@ -33,10 +36,14 @@ set(SOURCES
 	src/difficulty_type_tests.cpp
 	src/hash_tests.cpp
 	src/keccak_tests.cpp
+	src/merkle_tests.cpp
+	src/log_tests.cpp
 	src/main.cpp
 	src/pool_block_tests.cpp
+	src/sha256_tests.cpp
 	src/util_tests.cpp
 	src/wallet_tests.cpp
+	../external/src/crypto/sha256.c
 	../external/src/cryptonote/crypto-ops-data.c
 	../external/src/cryptonote/crypto-ops.c
 	../external/src/hardforks/hardforks.cpp
@@ -49,6 +56,9 @@ set(SOURCES
 	../src/log.cpp
 	../src/memory_leak_debug.cpp
 	../src/mempool.cpp
+	../src/merge_mining_client.cpp
+	../src/merge_mining_client_json_rpc.cpp
+	../src/merkle.cpp
 	../src/miner.cpp
 	../src/p2p_server.cpp
 	../src/p2pool.cpp
@@ -63,6 +73,13 @@ set(SOURCES
 	../src/wallet.cpp
 	../src/zmq_reader.cpp
 )
+
+if (AMD64)
+	set(SOURCES ${SOURCES} ../src/keccak_bmi.cpp)
+	if (CMAKE_C_COMPILER_ID MATCHES GNU OR CMAKE_C_COMPILER_ID MATCHES Clang)
+		set_source_files_properties(../src/keccak_bmi.cpp PROPERTIES COMPILE_FLAGS "${CMAKE_CXX_FLAGS} -mbmi")
+	endif()
+endif()
 
 if (NOT STATIC_BINARY AND NOT STATIC_LIBS)
 	include(FindCURL)
@@ -84,10 +101,12 @@ endif()
 
 include_directories(../src)
 include_directories(../external/src)
+include_directories(../external/src/crypto)
 include_directories(../external/src/cryptonote)
 include_directories(${UV_INCLUDE_DIR})
 include_directories(../external/src/cppzmq)
 include_directories(${ZMQ_INCLUDE_DIR})
+include_directories(../external/src/protobuf-c)
 include_directories(../external/src/RandomX/src)
 include_directories(../external/src/rapidjson/include)
 include_directories(../external/src/robin-hood-hashing/src/include)
@@ -113,8 +132,8 @@ if (STATIC_LIBS)
 	set(CURL_LIBRARY "${CMAKE_SOURCE_DIR}/../external/src/curl/lib/.libs/libcurl.a")
 else()
 	if (CMAKE_CXX_COMPILER_ID MATCHES MSVC)
-		find_library(ZMQ_LIBRARY_DEBUG NAMES libzmq-v142-mt-sgd-4_3_5 PATHS "../external/lib/libzmq/Debug")
-		find_library(ZMQ_LIBRARY NAMES libzmq-v142-mt-s-4_3_5 PATHS "../external/lib/libzmq/Release")
+		find_library(ZMQ_LIBRARY_DEBUG NAMES libzmq-v142-mt-sgd-4_3_6 PATHS "../external/lib/libzmq/Debug")
+		find_library(ZMQ_LIBRARY NAMES libzmq-v142-mt-s-4_3_6 PATHS "../external/lib/libzmq/Release")
 		find_library(UV_LIBRARY_DEBUG NAMES libuv PATHS "../external/lib/libuv/Debug")
 		find_library(UV_LIBRARY NAMES libuv PATHS "../external/lib/libuv/Release")
 		find_library(CURL_LIBRARY_DEBUG NAMES libcurl-d PATHS "../external/lib/libcurl/Debug")
