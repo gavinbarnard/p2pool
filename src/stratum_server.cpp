@@ -473,11 +473,11 @@ bool StratumServer::on_submit(StratumClient* client, uint32_t id, const char* jo
 		update_auto_diff(client, share->m_timestamp, share->m_hashes);
 
 		// If this share is below sidechain difficulty, process it in this thread because it'll be quick
-		if (!share->m_highEnoughDifficulty) {
-			on_share_found(&share->m_req);
-			on_after_share_found(&share->m_req, 0);
-			return true;
-		}
+		//if (!share->m_highEnoughDifficulty) {
+		//	on_share_found(&share->m_req);
+		//	on_after_share_found(&share->m_req, 0);
+		//	return true;
+		//}
 
 		// Else switch to a worker thread to check PoW which can take a long time
 		const int err = uv_queue_work(&m_loop, &share->m_req, on_share_found, on_after_share_found);
@@ -904,62 +904,64 @@ void StratumServer::on_share_found(uv_work_t* req)
 		LOGWARN(0, "p2pool is shutting down, but a share was found. Trying to process it anyway!");
 	}
 
-	if (share->m_highEnoughDifficulty) {
-		uint8_t blob[128];
-		uint64_t height;
-		difficulty_type difficulty;
-		difficulty_type aux_diff;
-		difficulty_type sidechain_difficulty;
-		hash seed_hash;
-		size_t nonce_offset;
+	// if (share->m_highEnoughDifficulty) {  # grb
 
-		const uint32_t blob_size = pool->block_template().get_hashing_blob(share->m_templateId, share->m_extraNonce, blob, height, difficulty, aux_diff, sidechain_difficulty, seed_hash, nonce_offset);
-		if (!blob_size) {
-			LOGWARN(4, "client " << static_cast<char*>(share->m_clientAddrString) << " got a stale share");
-			share->m_result = SubmittedShare::Result::STALE;
-			return;
+	uint8_t blob[128];
+	uint64_t height;
+	difficulty_type difficulty;
+	difficulty_type aux_diff;
+	difficulty_type sidechain_difficulty;
+	hash seed_hash;
+	size_t nonce_offset;
+
+	const uint32_t blob_size = pool->block_template().get_hashing_blob(share->m_templateId, share->m_extraNonce, blob, height, difficulty, aux_diff, sidechain_difficulty, seed_hash, nonce_offset);
+	if (!blob_size) {
+		LOGWARN(4, "client " << static_cast<char*>(share->m_clientAddrString) << " got a stale share");
+		share->m_result = SubmittedShare::Result::STALE;
+		return;
+	}
+
+	for (uint32_t i = 0, nonce = share->m_nonce; i < sizeof(share->m_nonce); ++i) {
+		blob[nonce_offset + i] = nonce & 255;
+		nonce >>= 8;
+	}
+
+	hash pow_hash;
+	if (!pool->calculate_hash(blob, blob_size, height, seed_hash, pow_hash, false)) {
+		LOGWARN(3, "client " << static_cast<char*>(share->m_clientAddrString) << " couldn't check share PoW");
+		share->m_result = SubmittedShare::Result::COULDNT_CHECK_POW;
+		return;
+	}
+
+	if (pow_hash != share->m_resultHash) {
+		LOGWARN(4, "client " << static_cast<char*>(share->m_clientAddrString) << " submitted a share with invalid PoW");
+		share->m_result = SubmittedShare::Result::INVALID_POW;
+		share->m_score = BAD_SHARE_POINTS;
+
+		// Calculate the same hash second time to check if it's an unstable hardware that caused this
+		hash pow_hash2;
+		if (pool->calculate_hash(blob, blob_size, height, seed_hash, pow_hash2, true) && (pow_hash2 != pow_hash)) {
+			LOGERR(0, "UNSTABLE HARDWARE DETECTED: Calculated the same hash twice, got different results: " << pow_hash << " != " << pow_hash2);
 		}
 
-		for (uint32_t i = 0, nonce = share->m_nonce; i < sizeof(share->m_nonce); ++i) {
-			blob[nonce_offset + i] = nonce & 255;
-			nonce >>= 8;
-		}
+		return;
+	}
 
-		hash pow_hash;
-		if (!pool->calculate_hash(blob, blob_size, height, seed_hash, pow_hash, false)) {
-			LOGWARN(3, "client " << static_cast<char*>(share->m_clientAddrString) << " couldn't check share PoW");
-			share->m_result = SubmittedShare::Result::COULDNT_CHECK_POW;
-			return;
-		}
+	share->m_score = GOOD_SHARE_POINTS;
 
-		if (pow_hash != share->m_resultHash) {
-			LOGWARN(4, "client " << static_cast<char*>(share->m_clientAddrString) << " submitted a share with invalid PoW");
-			share->m_result = SubmittedShare::Result::INVALID_POW;
-			share->m_score = BAD_SHARE_POINTS;
+	const double diff = sidechain_difficulty.to_double();
+	{
+		WriteLock lock(server->m_hashrateDataLock);
 
-			// Calculate the same hash second time to check if it's an unstable hardware that caused this
-			hash pow_hash2;
-			if (pool->calculate_hash(blob, blob_size, height, seed_hash, pow_hash2, true) && (pow_hash2 != pow_hash)) {
-				LOGERR(0, "UNSTABLE HARDWARE DETECTED: Calculated the same hash twice, got different results: " << pow_hash << " != " << pow_hash2);
-			}
+		const uint64_t n = server->m_cumulativeHashes + hashes;
+		share->m_effort = static_cast<double>(n - server->m_cumulativeHashesAtLastShare) * 100.0 / diff;
+		server->m_cumulativeHashesAtLastShare = n;
 
-			return;
-		}
+		server->m_cumulativeFoundSharesDiff += diff;
+		++server->m_totalFoundShares;
+	}
 
-		share->m_score = GOOD_SHARE_POINTS;
-
-		const double diff = sidechain_difficulty.to_double();
-		{
-			WriteLock lock(server->m_hashrateDataLock);
-
-			const uint64_t n = server->m_cumulativeHashes + hashes;
-			share->m_effort = static_cast<double>(n - server->m_cumulativeHashesAtLastShare) * 100.0 / diff;
-			server->m_cumulativeHashesAtLastShare = n;
-
-			server->m_cumulativeFoundSharesDiff += diff;
-			++server->m_totalFoundShares;
-		}
-
+	if (share->m_highEnoughDifficulty) {  // grb
 		if (!pool->submit_sidechain_block(share->m_templateId, share->m_nonce, share->m_extraNonce)) {
 			WriteLock lock(server->m_hashrateDataLock);
 
@@ -968,7 +970,7 @@ void StratumServer::on_share_found(uv_work_t* req)
 				++server->m_totalFailedShares;
 			}
 		}
-	}
+	}  // # grb 
 
 	// Send the response to miner
 	const uint64_t value = share->m_resultHash.u64()[HASH_SIZE / sizeof(uint64_t) - 1];
