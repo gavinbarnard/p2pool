@@ -265,6 +265,15 @@ cmake ..
 make -j$(nproc)
 ```
 
+Submodule maintenance commands
+```
+git checkout master
+git submodule init
+git submodule update
+git submodule --recursive git submodule init
+git submodule --recursive git submodule update
+```
+
 ### [Arch Linux](https://archlinux.org/packages/extra/x86_64/p2pool/)
 
 ```
