@@ -1330,8 +1330,8 @@ void StratumServer::api_update_local_stats(uint64_t timestamp)
 	int64_t dt_15m, dt_1h, dt_24h;
 
 	uint64_t hashes_since_last_share;
-	double average_effort;
-	uint32_t shares_found, shares_failed;
+	double average_effort, reward;
+	uint32_t shares_found, shares_failed, pshares;
 
 	{
 		ReadLock lock(m_hashrateDataLock);
@@ -1362,6 +1362,10 @@ void StratumServer::api_update_local_stats(uint64_t timestamp)
 
 		shares_found = m_totalFoundShares;
 		shares_failed = m_totalFailedShares;
+
+		reward = m_pool->side_chain().get_reward(m_pool->params().m_wallet);
+		pshares = m_pool->side_chain().get_shares_in_window();
+
 	}
 
 	const uint64_t hashrate_15m = (dt_15m > 0) ? (hashes_15m / dt_15m) : 0;
@@ -1381,6 +1385,8 @@ void StratumServer::api_update_local_stats(uint64_t timestamp)
 				<< ",\"hashrate_1h\":" << hashrate_1h
 				<< ",\"hashrate_24h\":" << hashrate_24h
 				<< ",\"total_hashes\":" << total_hashes
+				<< ",\"reward\":" << reward
+				<< ",\"p2pool_shares\":" << pshares
 				<< ",\"shares_found\":" << shares_found
 				<< ",\"shares_failed\":" << shares_failed
 				<< ",\"average_effort\":" << average_effort
