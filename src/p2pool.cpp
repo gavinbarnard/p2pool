@@ -521,7 +521,7 @@ void p2pool::handle_chain_main(ChainMain& data, const char* extra)
 				LOGINFO(0, log::LightCyan() << "Your wallet " << log::LightYellow() << w << log::LightCyan() << " didn't get a payout in block " << log::LightYellow() << data.height << log::LightCyan() << " because you had no shares in PPLNS window");
 			}
 
-			api_update_block_found(&data, block);
+			api_update_block_found(&data, block, false);
 		}
 		else {
 			side_chain().watch_mainchain_block(data, merkle_root);
@@ -658,7 +658,7 @@ void p2pool::submit_aux_block_async(const std::vector<SubmitAuxBlockData>& aux_b
 
 	// If p2pool is stopped, m_submitAuxBlockAsync is most likely already closed
 	if (m_stopped) {
-		LOGWARN(0, "p2pool is shutting down, but a block was found. Trying to submit it anyway!");
+		LOGWARN(0, "p2pool is shutting down, but an aux block was found. Trying to submit it anyway!");
 		submit_aux_block();
 		return;
 	}
@@ -1042,7 +1042,7 @@ void p2pool::download_block_headers(uint64_t current_height)
 
 					{
 						WriteLock lock(m_mergeMiningClientsLock);
-						m_mergeMiningClients = merge_mining_clients;
+						m_mergeMiningClients = std::move(merge_mining_clients);
 					}
 
 					m_startupFinished = true;
@@ -1680,7 +1680,7 @@ void p2pool::cleanup_mainchain_data(uint64_t height)
 	}
 }
 
-void p2pool::api_update_block_found(const ChainMain* data, const PoolBlock* block)
+void p2pool::api_update_block_found(const ChainMain* data, const PoolBlock* block, bool update_stats_mod)
 {
 	if (!m_api || m_stopped) {
 		return;
@@ -1727,7 +1727,9 @@ void p2pool::api_update_block_found(const ChainMain* data, const PoolBlock* bloc
 			s << ']';
 		});
 
-	api_update_stats_mod();
+	if (update_stats_mod) {
+		api_update_stats_mod();
+	}
 }
 
 bool p2pool::get_difficulty_at_height(uint64_t height, difficulty_type& diff)
@@ -1902,6 +1904,15 @@ int p2pool::run()
 		LOGERR(1, "failed to initialize signal handlers");
 		return 1;
 	}
+
+#ifdef WITH_TLS
+	if (!m_params->m_tlsCert.empty() && !m_params->m_tlsCertKey.empty()) {
+		if (!ServerTls::load_from_files(m_params->m_tlsCert.c_str(), m_params->m_tlsCertKey.c_str())) {
+			LOGERR(1, "Failed to load TLS files");
+			return 1;
+		}
+	}
+#endif
 
 	// Init default loop user data before running it
 	uv_loop_t* loop = uv_default_loop_checked();
